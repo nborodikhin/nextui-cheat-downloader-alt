@@ -20,14 +20,14 @@ This pak is tested on the following NextUI devices:
   a. Mount your NextUI SD card.
   b. Download .pak.tg5040.zip from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
   c. Unpack it into `/Tools/tg5040/`
-  d. You should have files in the subfolder, e.g. `/Tools/tg5040/Cheat Downloader Alt/launch.sh`
+  d. You should have files in the subfolder, e.g. `/Tools/tg5040/Cheat Downloader Offline/launch.sh`
   e. Unmount SD card
   f. Pak will be available on the next NextUI boot
 
 
 ## Usage
 
-1. Browse to `Tools > Cheat Downloader Alt` and press `A` to launch.
+1. Browse to `Tools > Cheat Downloader Offline` and press `A` to launch.
 2. On first launch, the app downloads the latest Libretro cheat database.
   a. Note that the download may take a few minutes - the archive is about 160MB
   b. On later launches it checks for updates and skips the download if your database is already current.
@@ -43,7 +43,7 @@ This pak is tested on the following NextUI devices:
 ## Technical Information
 
 - Cheats are installed to your NextUI Cheats folder, organized in subfolders by system tag (e.g. `GBA/`, `PS/`).
-- The cheat database is cached at `/mnt/SDCARD/.userdata/Cheat Downloader Alt/` as a local SQLite index, so searching is fast and works entirely offline after the initial download.
+- The cheat database is cached at `/mnt/SDCARD/.userdata/Cheat Downloader Offline/` as a local SQLite index, so searching is fast and works entirely offline after the initial download.
 - Folder-to-system mappings and your last-used game per system are remembered across sessions.
 
 ## Acknowledgements
@@ -52,4 +52,5 @@ This pak is tested on the following NextUI devices:
   - online-only downloader where the database is managed by the backend
 - [minui-list](https://github.com/josegonzalez/minui-list) by Jose Diaz-Gonzalez
 - [minui-presenter](https://github.com/josegonzalez/minui-presenter) by Jose Diaz-Gonzalez
+- [miniz](https://github.com/richgel999/miniz) — lightweight zip library
 - [libretro-database](https://github.com/libretro/libretro-database) for the cheat files

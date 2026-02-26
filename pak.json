@@ -1,15 +1,16 @@
 {
-  "name": "Cheat Downloader Alt",
-  "version": "v1.0.0",
+  "name": "Cheat Downloader Offline",
+  "version": "v1.1.0",
   "type": "TOOL",
   "description": "A NextUI pak for downloading cheats from the Libretro github repo.",
   "author": "nborodikhin",
   "repo_url": "https://github.com/nborodikhin/nextui-cheat-downloader-alt",
-  "release_filename": "CheatDownloaderAlt.pakz",
+  "release_filename": "CheatDownloaderOffline.pakz",
   "platforms": [
     "tg5040"
   ],
   "changelog": {
+    "v1.1.0": "Use zip file for faster cheat extraction time (supportied by packed miniz).",
     "v1.0.0": "Initial release."
   },
   "launch": "launch.sh",

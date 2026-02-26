@@ -21,7 +21,7 @@ if {[llength $missing] > 0} {
 # --- External Commands ---
 array set CMD {
     CURL            curl
-    TAR             tar
+    MZ              mz
     MINUI_PRESENTER minui-presenter
     MINUI_LIST      minui-list
 }
@@ -33,9 +33,9 @@ namespace eval STATE {
         # Sets up the STATE dict, file path, and JSON schema
         # using the global CACHE_DIR.
         global ENV
-        variable STATE [dict create dbVersion "" lastFolder "" tags [dict create] lastGame [dict create]]
+        variable STATE [dict create dbVersion "" dbFileSize 0 lastFolder "" tags [dict create] lastGame [dict create]]
         variable STATE_FILE "$ENV(CACHE_DIR)/state.json"
-        variable STATE_SCHEMA {obj dbVersion str lastFolder str tags {obj tag str} lastGame {obj tag str}}
+        variable STATE_SCHEMA {obj dbVersion str dbFileSize num lastFolder str tags {obj tag str} lastGame {obj tag str}}
     }
 
     proc load {} {
@@ -87,12 +87,30 @@ namespace eval STATE {
         return ""
     }
 
-    proc setCheatDbVersion {version} {
-        # Set and persist the cheat database version.
-        #  version - Version string to store.
+    proc setCheatDbVersion {version {file_size 0}} {
+        # Set and persist the cheat database version and file size.
+        #  version   - Version string to store.
+        #  file_size - Size of the archive file in bytes.
         variable STATE
         dict set STATE dbVersion $version
+        dict set STATE dbFileSize $file_size
         save
+    }
+
+    proc isDbFileMissing {path} {
+        # Check if the database archive is missing or corrupted.
+        #  path - Expected path to the archive file.
+        #
+        # Returns 1 if the file is missing or its size doesn't match
+        # the stored size, 0 otherwise.
+        variable STATE
+        if {![file exists $path]} { return 1 }
+        set stored_size 0
+        if {[dict exists $STATE dbFileSize]} {
+            set stored_size [dict get $STATE dbFileSize]
+        }
+        if {[file size $path] != $stored_size} { return 1 }
+        return 0
     }
 
     proc getSystem {tag} {
@@ -148,7 +166,7 @@ namespace eval CheatDb {
         global CMD
         set ARCHIVE_FILE $file
 
-        set db_file [regsub {\.tar\.gz$} $file .db]
+        set db_file [regsub {\.zip$} $file .db]
 
         # Open (or create) the database
         if {[catch {set DB [sqlite3.open $db_file]} err]} {
@@ -181,7 +199,7 @@ namespace eval CheatDb {
 
         if {![file exists $file]} { return }
 
-        if {[catch {set pipe [open [list | $CMD(TAR) tzf $file] r]} err]} {
+        if {[catch {set pipe [open [list | $CMD(MZ) -l $file] r]} err]} {
             puts "Error reading archive: $err"
             return
         }
@@ -245,14 +263,12 @@ namespace eval CheatDb {
         if {[llength $rows] == 0} { return 0 }
         set path [dict get [lindex $rows 0] path]
 
-        set tmp_path "$ENV(CACHE_DIR)/cheat_extract.tmp"
-        debug "Extracting archive path: $path -> $tmp_path"
-        if {[catch {exec $CMD(TAR) xzf $ARCHIVE_FILE -O $path > $tmp_path} err]} {
+        debug "Extracting archive path: $path -> $target"
+        if {[catch {exec $CMD(MZ) -x $ARCHIVE_FILE $path $target} err]} {
             puts "Error extracting cheat: $err"
-            file delete -force $tmp_path
+            file delete -force $target
             return 0
         }
-        file rename -force $tmp_path $target
         return 1
     }
 
@@ -744,8 +760,8 @@ proc main {} {
                 UI::message "Checking for updates..."
                 set latestVersion [check_update]
                 set currentVersion [STATE::getCheatDbVersion]
-                set db_file "$ENV(CACHE_DIR)/cheats.tar.gz"
-                if {$currentVersion ne "" && ![file exists $db_file]} {
+                set db_file "$ENV(CACHE_DIR)/cheats.zip"
+                if {$currentVersion ne "" && [STATE::isDbFileMissing $db_file]} {
                     set currentVersion ""
                     STATE::setCheatDbVersion ""
                 }
@@ -780,9 +796,10 @@ proc main {} {
             }
 
             DOWNLOAD {
-                set url "https://github.com/libretro/libretro-database/archive/refs/tags/${latestVersion}.tar.gz"
-                if {[download_file $url "$ENV(CACHE_DIR)/cheats.tar.gz"]} {
-                    STATE::setCheatDbVersion $latestVersion
+                set url "https://github.com/libretro/libretro-database/archive/refs/tags/${latestVersion}.zip"
+                set db_file "$ENV(CACHE_DIR)/cheats.zip"
+                if {[download_file $url $db_file]} {
+                    STATE::setCheatDbVersion $latestVersion [file size $db_file]
                     if {!$is_first_install} { UI::message "Update Complete!" 2 }
                     set state INIT_DB
                 } elseif {$is_first_install} {
@@ -795,7 +812,7 @@ proc main {} {
 
             INIT_DB {
                 UI::message "Checking cheat archive..."
-                CheatDb::init "$ENV(CACHE_DIR)/cheats.tar.gz"
+                CheatDb::init "$ENV(CACHE_DIR)/cheats.zip"
                 set state SELECT_GAME_FOLDER
             }
 
