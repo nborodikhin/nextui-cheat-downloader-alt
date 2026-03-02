@@ -353,7 +353,7 @@ namespace eval UI {
         }
     }
 
-    proc messages {lines} {
+    proc messages {lines {timeout 86400}} {
         # Display multiple messages to the user, see also [next_message].
         #  lines   - List of message strings to display.
         #
@@ -384,7 +384,7 @@ namespace eval UI {
             puts $fh [json::encode $data {obj items {list obj}}]
             close $fh
 
-            set PRESENTER_PID [exec $CMD(MINUI_PRESENTER) --file $json_file --disable-auto-sleep &]
+            set PRESENTER_PID [exec $CMD(MINUI_PRESENTER) --file $json_file --disable-auto-sleep --timeout $timeout &]
         }
     }
 
@@ -489,24 +489,15 @@ namespace eval UI {
 
             # Convert to minui-list format: list of objects with "name" and "selected" properties
             set minui_items [::list]
-            set item_idx 0
             foreach item $norm_items {
                 set name [dict get $item text]
-                set item [dict create name $name]
-                if {$item_idx == $selected_index} {
-                    dict set item selected -1
-                    dict set item unselecteable true
-                    #$item_idx
-                }
-                debug "Item: $item"
-                lappend minui_items $item
-                incr item_idx
+                lappend minui_items [dict create name $name]
             }
 
-            set data [dict create items $minui_items]
+            set data [dict create items $minui_items selected $selected_index]
 
             set fh [open $json_file w]
-            puts $fh [json::encode $data {obj items {list obj name str * num}}]
+            puts $fh [json::encode $data {obj items {list obj name str} selected num}]
             close $fh
 
             # We use --write-value state to get the selected index, then map back to ID
@@ -584,7 +575,7 @@ proc download_file {url output_path} {
     for {set i 1} {$i < $max_mb} {incr i} {
        lappend messages "Downloading cheat archive [file tail $url]. Progress: ${i} MB of about 170 MB"
     }
-    UI::messages $messages
+    UI::messages $messages -1
 
     set tmp_path "${output_path}.tmp"
     file delete -force $tmp_path

@@ -1,6 +1,6 @@
 {
   "name": "Cheat Downloader Offline",
-  "version": "v1.1.0",
+  "version": "v1.2.0",
   "type": "TOOL",
   "description": "A NextUI pak for downloading cheats from the Libretro github repo.",
   "author": "nborodikhin",
@@ -10,9 +10,9 @@
     "tg5040"
   ],
   "changelog": {
+    "v1.2.0": "Suppress buttons on downloading screen, restore last position in lists (using unofficial builds of minui-list and minui-presenter).",
     "v1.1.0": "Use zip file for faster cheat extraction time (supportied by packed miniz).",
     "v1.0.0": "Initial release."
   },
-  "launch": "launch.sh",
-  "version": "v0.1"
+  "launch": "launch.sh"
 }
