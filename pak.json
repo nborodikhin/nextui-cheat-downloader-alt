@@ -1,15 +1,18 @@
 {
   "name": "Cheat Downloader Offline",
-  "version": "v1.2.0",
+  "version": "v1.3.0",
   "type": "TOOL",
-  "description": "A NextUI pak for downloading cheats from the Libretro github repo.",
+  "description": "A NextUI pak for getting cheats from the Libretro github repo. Needs internet only for the initial database download.",
   "author": "nborodikhin",
   "repo_url": "https://github.com/nborodikhin/nextui-cheat-downloader-alt",
   "release_filename": "CheatDownloaderOffline.pakz",
   "platforms": [
-    "tg5040"
+    "tg5040",
+    "tg5050",
+    "my355"
   ],
   "changelog": {
+    "v1.3.0": "Use official builds of minui-list and minui-presenter, add tg5050 and my355 support",
     "v1.2.0": "Suppress buttons on downloading screen, restore last position in lists (using unofficial builds of minui-list and minui-presenter).",
     "v1.1.0": "Use zip file for faster cheat extraction time (supportied by packed miniz).",
     "v1.0.0": "Initial release."

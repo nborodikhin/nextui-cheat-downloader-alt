@@ -16,9 +16,9 @@ This pak is tested on the following NextUI devices:
   c. Put it into the root of the SD card
   d. Unmount SD card
   e. Pak will be installed on the next NextUI boot
-2. Manual
+2. Manual (here for tg5040, replace with your device identifier is needed)
   a. Mount your NextUI SD card.
-  b. Download .pak.tg5040.zip from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
+  b. Download CheatDownloader.pak.tg5040.zip from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
   c. Unpack it into `/Tools/tg5040/`
   d. You should have files in the subfolder, e.g. `/Tools/tg5040/Cheat Downloader Offline/launch.sh`
   e. Unmount SD card
