@@ -1,43 +1,25 @@
 #!/bin/sh
 
-JIM_VER=0.83
-MINUI_LIST_VER=0.13.0
+MINUI_LIST_VER=0.14.0
 MINUI_PRESENTER_VER=0.12.0
 MINIZ_VER=3.1.1
+NIM_VER=2.2.8
 
 for PLATFORM in tg5040 tg5050 my355; do
   mkdir deps
   mkdir workspace
-  JIMBIN=deps/jimsh-$PLATFORM
-  MZBIN=deps/mz-$PLATFORM
   MINUI_LIST_BIN=deps/minui-list-$PLATFORM
   MINUI_PRESENTER_BIN=deps/minui-presenter-$PLATFORM
+  NIMDIR=nim-$NIM_VER
+  NIMBIN=workspace/$NIMDIR/bin/nim
 
   MAKEFLAGS="-j8"
 
-  if [ ! -f $JIMBIN ]; then
-    jimdir=jimtcl-${JIM_VER}
-    jimdlflag=workspace/jimtcl.downloaded
-    [ ! -f $jimdlflag ] && ( wget https://github.com/msteveb/jimtcl/archive/refs/tags/${JIM_VER}.tar.gz -O workspace/jimtcl-${JIM_VER}.tar.gz && touch $jimdlflag )
-    [ ! -d workspace/$jimdir ] && ( cd workspace; tar -zxvf jimtcl-${JIM_VER}.tar.gz )
-
-    echo "cd $jimdir; ./configure --disable-ssl --with-ext=sqlite3; make clean; make ${MAKEFLAGS}; \${CROSS_ROOT}/bin/\${CROSS_COMPILE}strip jimsh" > workspace/buildjim.sh
-    docker run -it -v `pwd`/workspace/:/root/workspace --rm ghcr.io/loveretro/${PLATFORM}-toolchain /bin/sh buildjim.sh
-
-    cp workspace/$jimdir/jimsh $JIMBIN
-  fi
-
-  if [ ! -f $MZBIN ]; then
-    minizdir=miniz-${MINIZ_VER}
+  minizdir=miniz-${MINIZ_VER}
+  if [ ! -f $minizdir ]; then
     minizdlflag=workspace/miniz.downloaded
     [ ! -f minizdlflag ] && ( wget https://github.com/richgel999/miniz/releases/download/${MINIZ_VER}/miniz-${MINIZ_VER}.zip -O workspace/miniz-${MINIZ_VER}.zip && touch $minizdlflag )
     [ ! -d workspace/$minizdir ] && ( cd workspace; mkdir $minizdir; cd $minizdir; unzip ../miniz-${MINIZ_VER}.zip )
-    [ ! -f workspace/$minizdir/mz.c ] && ( cp mz.c workspace/$minizdir/ )
-
-    echo "cd $minizdir; \${CROSS_ROOT}/bin/\${CROSS_COMPILE}gcc -Os mz.c miniz.c -o mz && \${CROSS_ROOT}/bin/\${CROSS_COMPILE}strip mz" > workspace/buildminizip.sh
-    docker run -it -v `pwd`/workspace/:/root/workspace --rm ghcr.io/loveretro/${PLATFORM}-toolchain /bin/sh buildminizip.sh
-
-    cp workspace/$minizdir/mz $MZBIN
   fi
 
   if [ ! -s $MINUI_LIST_BIN ]; then
@@ -59,3 +41,17 @@ for PLATFORM in tg5040 tg5050 my355; do
   fi
 
 done
+
+
+# host
+if [ ! -f $NIMBIN ]; then
+  nimdlflag=worspace/nim.downloaded
+  nimpkg=nim-$NIM_VER.tar.xz
+
+  [ ! -f $nimdlflag ] && ( wget -c https://nim-lang.org/download/nim-2.2.8-linux_x64.tar.xz -O workspace/$nimpkg && touch $nimdlflag )
+  [ ! -f $NIMBIN ] && ( cd workspace && tar -xJvf $nimpkg )
+fi
+
+if [ ! -f workspace/workspace ]; then
+  cd workspace; ln -s . workspace
+fi

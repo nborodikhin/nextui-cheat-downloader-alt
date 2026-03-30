@@ -12,6 +12,7 @@
     "my355"
   ],
   "changelog": {
+    "v1.4.0": "Sort cheats ignoring case, fix overlapping in list selectors, rewrite app in Nim",
     "v1.3.0": "Use official builds of minui-list and minui-presenter, add tg5050 and my355 support",
     "v1.2.0": "Suppress buttons on downloading screen, restore last position in lists (using unofficial builds of minui-list and minui-presenter).",
     "v1.1.0": "Use zip file for faster cheat extraction time (supportied by packed miniz).",

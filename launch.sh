@@ -18,4 +18,4 @@ export CACHE_DIR="$HOME/$PAK_NAME"
 mkdir -p "$CACHE_DIR"
 
 cd "$PAK_DIR"
-jimsh cheat-manager.tcl
+./cheat_manager

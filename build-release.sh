@@ -12,14 +12,20 @@ for PLATFORM in tg5040 tg5050 my355; do
   PAK_DIR="$TOOLS_DIR/$PAK_DIR_NAME"
   BIN_DIR="$PAK_DIR/bin/arm"
 
+  sh build-binary.sh $PLATFORM release
+
   mkdir -p "$PAK_DIR"
-  for file in launch.sh cheat-manager.tcl README.md pak.json; do
+  for file in launch.sh README.md pak.json; do
     cp $file "$PAK_DIR/"
   done
 
   mkdir -p "$BIN_DIR"
-  for binary in jimsh minui-list minui-presenter mz; do
+  for binary in minui-list minui-presenter; do
     cp deps/$binary-$PLATFORM "$BIN_DIR/$binary"
+  done
+
+  for binary in cheat_manager; do
+    cp workspace/$binary-$PLATFORM "$BIN_DIR/$binary"
   done
 
   ( cd "$TOOLS_DIR"; zip -r "$PAK_FILE_NAME" "$PAK_DIR_NAME" )
