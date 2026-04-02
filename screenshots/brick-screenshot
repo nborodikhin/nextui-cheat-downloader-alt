@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Grab a screenshot from a TrimUI device via adb.
+# Usage: adb-screenshot <output.png>
+
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <output.png>" >&2
+    exit 1
+fi
+
+OUTPUT="$1"
+DEVICE_RAW="/tmp/screen.raw"
+LOCAL_RAW="$(mktemp /tmp/screenshot-XXXXXX.raw)"
+trap 'rm -f "$LOCAL_RAW"' EXIT
+
+# Get framebuffer parameters
+WIDTH=1024
+BPP=4
+STRIDE=$((WIDTH * BPP))
+
+# Get pan offset (currently displayed page)
+PAN_LINE=$(adb shell "cat /sys/class/graphics/fb0/pan" | tr -d '\r')
+PAN_Y=${PAN_LINE#*,}
+
+# Get display height from mode
+MODE=$(adb shell "cat /sys/class/graphics/fb0/modes" | tr -d '\r')
+# Parse height from e.g. "U:1024x768p-60"
+HEIGHT=$(echo "$MODE" | sed 's/.*x\([0-9]*\).*/\1/')
+
+echo "Display: ${WIDTH}x${HEIGHT}, pan_y=${PAN_Y}, bpp=${BPP}"
+
+# Grab the visible page
+adb shell "dd if=/dev/fb0 of=${DEVICE_RAW} bs=${STRIDE} skip=${PAN_Y} count=${HEIGHT} 2>/dev/null"
+adb pull "$DEVICE_RAW" "$LOCAL_RAW" > /dev/null
+adb shell "rm ${DEVICE_RAW}"
+
+# Convert to PNG, might need tweaking pixel format - bgra, rgba or argb
+ffmpeg -y -f rawvideo -pix_fmt bgra -s "${WIDTH}x${HEIGHT}" -i "$LOCAL_RAW" "$OUTPUT" 2>/dev/null
+
+echo "Saved: $OUTPUT"

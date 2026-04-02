@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Convert numbered screenshots to animated GIF (2 seconds per frame)
+# Usage: ./screenshot2gif [output.gif]
+
+OUTPUT="${1:-output.gif}"
+
+# Use -vf fps=0.5 for 0.5 fps (2 seconds per frame)
+ffmpeg -framerate 0.5 -pattern_type glob -i '*.png' -vf "fps=0.5" "$OUTPUT"
+
+echo "Created $OUTPUT"
