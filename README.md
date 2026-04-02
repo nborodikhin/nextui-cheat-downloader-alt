@@ -2,6 +2,8 @@
 
 A MinUI pak for browsing, finding, and installing game cheat files from the Libretro database directly on your device.
 
+<img width="300" alt="Screenshots" src="/screenshots/screenshots.gif"/>
+
 ## Requirements
 
 This pak is tested on the following NextUI devices:
