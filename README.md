@@ -13,30 +13,37 @@ This pak is tested on the following NextUI devices:
 ## Installation
 
 1. Simple
-  a. Mount your NextUI SD card.
-  b. Download .pakz from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
-  c. Put it into the root of the SD card
-  d. Unmount SD card
-  e. Pak will be installed on the next NextUI boot
+
+    - Mount your NextUI SD card.
+    - Download .pakz from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
+    - Put it into the root of the SD card
+    - Unmount SD card
+    - Pak will be installed on the next NextUI boot
+
 2. Manual (here for tg5040, replace with your device identifier is needed)
-  a. Mount your NextUI SD card.
-  b. Download CheatDownloader.pak.tg5040.zip from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
-  c. Unpack it into `/Tools/tg5040/`
-  d. You should have files in the subfolder, e.g. `/Tools/tg5040/Cheat Downloader Offline/launch.sh`
-  e. Unmount SD card
-  f. Pak will be available on the next NextUI boot
+
+    - Mount your NextUI SD card.
+    - Download CheatDownloader.pak.tg5040.zip from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
+    - Unpack it into `/Tools/tg5040/`
+    - You should have files in the subfolder, e.g. `/Tools/tg5040/Cheat Downloader Offline/launch.sh`
+    - Unmount SD card
+    - Pak will be available on the next NextUI boot
 
 
 ## Usage
 
 1. Browse to `Tools > Cheat Downloader Offline` and press `A` to launch.
 2. On first launch, the app downloads the latest Libretro cheat database.
-  a. Note that the download may take a few minutes - the archive is about 160MB
-  b. On later launches it checks for updates and skips the download if your database is already current.
+  
+    - Note that the download may take a few minutes - the archive is about 160MB
+    - On later launches it checks for updates and skips the download if your database is already current.
+  
 3. **Select a game folder** — the app lists ROM directories on the device. Press `A` to enter one.
 4. **Select a game** — browse the games in that folder and press `A` to select one.
-  a. Pak supports single-file games, as well as an `.m3u` file in the game directory
-  b. Pak supports folders, provided that a folder has an `.m3u` file
+
+    - Pak supports single-file games, as well as an `.m3u` file in the game directory
+    - Pak supports folders, provided that a folder has an `.m3u` file
+  
 5. **Map the system** (first time only per folder) — if the app doesn't yet know which cheat system matches this ROM folder, it asks you to pick one from the database. Your choice is saved and reused automatically from then on.
 6. **Select a cheat** — the app searches the database for cheats that match your game using three-tier matching: exact filename first, then title-only, then fuzzy. Pick a cheat and press `A` to install it. If nothing is found, you can browse all cheats for the system or remap the system.
 7. The cheat file is installed. The app returns to game selection so you can install more cheats.
