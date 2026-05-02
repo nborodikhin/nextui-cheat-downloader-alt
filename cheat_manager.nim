@@ -4,7 +4,7 @@
 ## Persists state as JSON, indexes zip archives into SQLite,
 ## and provides dual-mode UI (text terminal or minui-presenter/minui-list).
 
-import std/[json, osproc, os, posix, streams, strutils, algorithm]
+import std/[json, osproc, os, posix, streams, strutils, strformat, algorithm]
 import db_connector/db_sqlite
 import miniz
 
@@ -83,7 +83,7 @@ const
   CMD_MINUI_LIST = "minui-list"
 
   EXCLUDED_EXTS = [".txt", ".md", ".xml", ".db", ".pdf", ".cht", ".png",
-                   ".jpg", ".jpeg"]
+                   ".jpg", ".jpeg", ".srm", ".sav"]
 
 # ---------------------------------------------------------------------------
 # Debug
@@ -546,6 +546,90 @@ proc normalizeTitle(s: string): string =
     if c.isAlphaNumeric: filtered.add(c)
   return filtered.toLowerAscii()
 
+proc formatCheatDisplay(filename: string): string =
+  ## Format a cheat filename with [TOOL|REGION] badge prefix.
+  ## Recognized tool/region groups are stripped; unrecognized groups stay in the title.
+  ## "Castlevania (Action Replay) (USA).cht"  -> "[AR|US] Castlevania"
+  ## "Zanac (V2).cht"                         -> "Zanac (V2)"
+  ## "Some Game (V2) (USA).cht"               -> "[US] Some Game (V2)"
+  let name = splitFile(filename).name
+
+  var tools:   seq[string] = @[]
+  var regions: seq[string] = @[]
+  var titleBuf = ""
+
+  var i = 0
+  while i < name.len:
+    let chr = name[i]
+
+    if chr == '(':
+      let j = name.find(')', i + 1)
+      if j >= 0:
+        let raw = name[i + 1 ..< j]
+        let g   = raw.toLowerAscii()
+
+        var tool = ""
+        if "action replay" in g:   tool = "AR"
+        elif "gameshark" in g or "game shark" in g: tool = "GS"
+        elif "game genie" in g:    tool = "GG"
+        elif "game buster" in g:   tool = "GB"
+        elif "code breaker" in g or "codebreaker" in g: tool = "CB"
+        elif "xploder" in g:       tool = "XP"
+
+        var region = ""
+        if "usa" in g:             region = "US"
+        elif "japan" in g:         region = "JP"
+        elif "europe" in g:        region = "EU"
+        elif "world" in g:         region = "WD"
+        elif "australia" in g:     region = "AU"
+        elif "brazil" in g:        region = "BR"
+        elif "korea" in g:         region = "KR"
+        elif "germany" in g:       region = "DE"
+        elif "france" in g:        region = "FR"
+        elif "spain" in g:         region = "ES"
+        elif "italy" in g:         region = "IT"
+        elif "canada" in g:        region = "CA"
+        elif "mexico" in g:        region = "MX"
+        elif "china" in g:         region = "CN"
+        elif "taiwan" in g:        region = "TW"
+        elif "russia" in g:        region = "RU"
+        elif "sweden" in g:        region = "SE"
+        elif "denmark" in g:       region = "DK"
+        elif "netherlands" in g:   region = "NL"
+        elif "scandinavia" in g:   region = "SC"
+        elif "uk" in g:            region = "UK"
+        elif "norway" in g:        region = "NO"
+        elif "portugal" in g:      region = "PT"
+        elif "greece" in g:        region = "GR"
+        elif "asia" in g:          region = "AS"
+
+        if tool != "":
+          tools.add(tool)
+        elif region != "":
+          regions.add(region)
+        else:
+          titleBuf = titleBuf.strip(leading = false)
+          titleBuf.add(fmt" ({raw})")
+
+        i = j + 1
+      else:
+        titleBuf.add(chr)
+        inc i
+    else:
+      titleBuf.add(chr)
+      inc i
+
+  let title = titleBuf.strip()
+
+  if tools.len > 0 and regions.len > 0:
+    return fmt"{title} [{tools[0]}|{regions[0]}]"
+  elif tools.len > 0:
+    return fmt"{title} [{tools[0]}]"
+  elif regions.len > 0:
+    return fmt"{title} [{regions[0]}]"
+  else:
+    return title
+
 proc checkUpdate(): string =
   ## Check GitHub for the latest libretro-database release tag.
   ## Returns the tag string, or "" on failure.
@@ -657,8 +741,27 @@ proc downloadFile(url, outputPath: string): bool =
 # Browser Logic
 # ---------------------------------------------------------------------------
 
+proc extractTag(dirName: string): string =
+  ## Extract the system tag from a ROM directory name.
+  if dirName.len > 0 and dirName.allCharsInSet({'A'..'Z', '0'..'9'}):
+    return dirName
+  if dirName.endsWith(')'):
+    let p = dirName.rfind('(')
+    if p >= 0:
+      return dirName[p + 1 .. ^2]
+  return ""
+
+proc hasGameFiles(dirPath: string): bool =
+  for path in walkDirRec(dirPath):
+    let name = extractFilename(path)
+    if name.startsWith("."): continue
+    let ext = splitFile(name).ext.toLowerAscii()
+    if ext notin EXCLUDED_EXTS:
+      return true
+  return false
+
 proc browserListDirs(): seq[DirEntry] =
-  ## List ROM subdirectories sorted alphabetically.
+  ## List ROM subdirectories that have a parseable tag and contain game files.
   result = @[]
   var entries: seq[string] = @[]
   for kind, path in walkDir(env.romDir):
@@ -667,7 +770,11 @@ proc browserListDirs(): seq[DirEntry] =
   entries.sort(proc(a, b: string): int = cmpIgnoreCase(extractFilename(a),
                extractFilename(b)))
   for d in entries:
-    result.add(DirEntry(name: extractFilename(d), path: d))
+    let name = extractFilename(d)
+    if name.startsWith("."): continue
+    if extractTag(name) == "": continue
+    if not hasGameFiles(d): continue
+    result.add(DirEntry(name: name, path: d))
 
 proc browserListGames(dirPath: string): seq[DirEntry] =
   ## List game files within a ROM directory.
@@ -717,16 +824,6 @@ proc browserListGames(dirPath: string): seq[DirEntry] =
         if validGameFound:
           result.add(DirEntry(name: name, path: f))
 
-proc extractTag(dirName: string): string =
-  ## Extract the system tag from a ROM directory name.
-  if dirName.len > 0 and dirName.allCharsInSet({'A'..'Z', '0'..'9'}):
-    return dirName
-  if dirName.endsWith(')'):
-    let p = dirName.rfind('(')
-    if p >= 0:
-      return dirName[p + 1 .. ^2]
-  return ""
-
 proc ensureDirs() =
   createDir(env.cacheDir)
   createDir(env.cheatDir)
@@ -739,6 +836,50 @@ proc main() =
   ensureDirs()
   stateStore = createStateStore(env.cacheDir / "state.json")
   stateStore.load()
+
+  # Pre-populate known tag→system mappings (INSERT OR IGNORE semantics)
+  let knownMappings = [
+    (@["GBA", "MGBA"],           "Nintendo - Game Boy Advance"),
+    (@["GBC"],                   "Nintendo - Game Boy Color"),
+    (@["GB", "GB0", "SGB"],      "Nintendo - Game Boy"),
+    (@["FC", "NES"],             "Nintendo - Nintendo Entertainment System"),
+    (@["SFC", "SNES", "SUPA"],   "Nintendo - Super Nintendo Entertainment System"),
+    (@["N64"],                   "Nintendo - Nintendo 64"),
+    (@["NDS", "NDS2"],           "Nintendo - Nintendo DS"),
+    (@["FDS"],                   "Nintendo - Family Computer Disk System"),
+    (@["BSX"],                   "Nintendo - Satellaview"),
+    (@["MD", "GEN", "GENESIS"],  "Sega - Mega Drive - Genesis"),
+    (@["GG"],                    "Sega - Game Gear"),
+    (@["MS", "SMS", "SMSGG"],    "Sega - Master System - Mark III"),
+    (@["32X"],                   "Sega - 32X"),
+    (@["SS", "SAT"],             "Sega - Saturn"),
+    (@["DC"],                    "Sega - Dreamcast"),
+    (@["MCD", "SCD", "SEGACD"],  "Sega - Mega-CD - Sega CD"),
+    (@["PS", "PSX", "PS1"],      "Sony - PlayStation"),
+    (@["PSP"],                   "Sony - PlayStation Portable"),
+    (@["PCE", "TG16"],           "NEC - PC Engine - TurboGrafx 16"),
+    (@["PCECD"],                 "NEC - PC Engine CD - TurboGrafx-CD"),
+    (@["SGFX"],                  "NEC - PC Engine SuperGrafx"),
+    (@["ATARI", "A26", "A2600", "ATARI2600"], "Atari - 2600"),
+    (@["LYNX"],                  "Atari - Lynx"),
+    (@["A7800", "ATARI7800"],    "Atari - 7800"),
+    (@["A5200"],                 "Atari - 5200"),
+    (@["A800"],                  "Atari - 8-bit Family"),
+    (@["JAGUAR"],                "Atari - Jaguar"),
+    (@["ARCADE", "FBN", "FBNEO", "MAME", "MAME2003PLUS", "CPS1", "CPS2", "CPS3", "NEOGEO", "PGM"], "FBNeo - Arcade Games"),
+    (@["GX4000"],                "Amstrad - GX4000"),
+    (@["MSX", "MSX2"],           "Microsoft - MSX - MSX2 - MSX2P - MSX Turbo R"),
+    (@["CV", "COLECO"],          "Coleco - ColecoVision"),
+    (@["INTV"],                  "Mattel - Intellivision"),
+    (@["DOS"],                   "DOS"),
+    (@["PRBOOM"],                "PrBoom"),
+    (@["ZX"],                    "Sinclair - ZX Spectrum +3"),
+    (@["TIC80"],                 "TIC-80"),
+  ]
+  for (tags, s) in knownMappings:
+    for t in tags:
+      if stateStore.getSystem(t) == "":
+        stateStore.setSystem(t, s)
 
   # Shared context
   var
@@ -821,6 +962,10 @@ proc main() =
 
     of SELECT_GAME_FOLDER:
       let dirs = browserListDirs()
+      if dirs.len == 0:
+        ui.message("No supported ROM folders found. Check that your ROM folders use the 'System (TAG)' naming convention.", 5)
+        state = EXIT
+        continue
       var dirItems: seq[string] = @[]
       let lastFolder = stateStore.getLastFolder()
       var selectedIdx = 0
@@ -949,9 +1094,15 @@ proc main() =
         state = SELECT_CHEAT_FROM_MATCHED
 
     of SELECT_CHEAT_FROM_MATCHED:
-      var cheatItems: seq[string] = @[]
+      var pairs: seq[(string, int)] = @[]
       for cid in allMatches:
-        cheatItems.add(cheatDb.getCheatName(cid))
+        pairs.add((formatCheatDisplay(cheatDb.getCheatName(cid)), cid))
+      pairs.sort(proc(a, b: (string, int)): int = cmpIgnoreCase(a[0], b[0]))
+      var cheatItems: seq[string] = @[]
+      var sortedMatchIds: seq[int] = @[]
+      for (name, cid) in pairs:
+        cheatItems.add(name)
+        sortedMatchIds.add(cid)
 
       var showAllIdx = -1
       if tier3.len > 0 and allMatches.len != allIds.len:
@@ -970,25 +1121,41 @@ proc main() =
       elif idx < 0:
         state = SELECT_GAME
       else:
-        selectedCheatId = allMatches[idx]
+        selectedCheatId = sortedMatchIds[idx]
         state = INSTALL_CHEAT
 
     of SELECT_CHEAT_FROM_ALL:
-      var cheatItems: seq[string] = @[]
+      var pairs: seq[(string, int)] = @[]
       for cid in allIds:
-        cheatItems.add(cheatDb.getCheatName(cid))
+        pairs.add((formatCheatDisplay(cheatDb.getCheatName(cid)), cid))
+      pairs.sort(proc(a, b: (string, int)): int = cmpIgnoreCase(a[0], b[0]))
+      var cheatItems: seq[string] = @[]
+      var sortedAllIds: seq[int] = @[]
+      for (name, cid) in pairs:
+        cheatItems.add(name)
+        sortedAllIds.add(cid)
 
       let changeFolderIdx = cheatItems.len()
       cheatItems.add("Change cheat folder")
 
-      let idx = ui.list("Select Cheat for " & gameBase, cheatItems)
+      # Start cursor at the first matched item in sorted order
+      var initialIdx = 0
+      for i, cid in sortedAllIds:
+        if cid in allMatches:
+          initialIdx = i
+          break
+
+      let idx = ui.list("Select Cheat for " & gameBase, cheatItems, initialIdx)
 
       if idx == changeFolderIdx:
         state = MAP_SYSTEM
       elif idx < 0:
-        state = SELECT_GAME
+        if allMatches.len > 0:
+          state = SELECT_CHEAT_FROM_MATCHED
+        else:
+          state = SELECT_GAME
       else:
-        selectedCheatId = allIds[idx]
+        selectedCheatId = sortedAllIds[idx]
         state = INSTALL_CHEAT
 
     of INSTALL_CHEAT:
