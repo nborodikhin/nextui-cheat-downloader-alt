@@ -19,6 +19,7 @@ type
     cheatDir: string
 
   AppState = enum
+    FIND_LOCAL_DB
     CHECK_UPDATE
     CONFIRM_DOWNLOAD
     CONFIRM_UPDATE
@@ -33,24 +34,24 @@ type
     INSTALL_CHEAT
     EXIT
 
-  StateStore = object
-    load: proc()
-    save: proc()
-    getCheatDbVersion: proc(): string
-    setCheatDbVersion: proc(version: string, fileSize: int64 = 0)
-    isDbFileMissing: proc(path: string): bool
-    getSystem: proc(tag: string): string
-    setSystem: proc(tag, system: string)
-    getLastFolder: proc(): string
-    setLastFolder: proc(name: string)
-    getLastGame: proc(tag: string): string
-    setLastGame: proc(tag, game: string)
+  StateStore* = object
+    load*: proc()
+    save*: proc()
+    getCheatDbVersion*: proc(): string
+    setCheatDbVersion*: proc(version: string, fileSize: int64 = 0)
+    isDbFileMissing*: proc(path: string): bool
+    getSystem*: proc(tag: string): string
+    setSystem*: proc(tag, system: string)
+    getLastFolder*: proc(): string
+    setLastFolder*: proc(name: string)
+    getLastGame*: proc(tag: string): string
+    setLastGame*: proc(tag, game: string)
 
-  CheatDb = object
-    getSystems: proc(): seq[string]
-    getAllCheats: proc(system: string): seq[int]
-    getCheatName: proc(id: int): string
-    extractCheat: proc(id: int, target: string): bool
+  CheatDb* = object
+    getSystems*: proc(): seq[string]
+    getAllCheats*: proc(system: string): seq[int]
+    getCheatName*: proc(id: int): string
+    extractCheat*: proc(id: int, target: string): bool
 
   UI = object
     killPresenter: proc(signal: cint = SIGKILL, cleanup: bool = true)
@@ -62,9 +63,9 @@ type
     list: proc(title: string, items: seq[string],
                 selectedIndex: int = 0): int
 
-  DirEntry = object
-    name: string
-    path: string
+  DirEntry* = object
+    name*: string
+    path*: string
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -76,6 +77,7 @@ var
   cheatDb: CheatDb
   ui: UI
   debugMode: bool = false
+  offlineMode: bool = false
 
 const
   CMD_CURL = "curl"
@@ -115,7 +117,7 @@ proc execCmdRaw(command: string, args: openArray[string],
 # StateStore
 # ---------------------------------------------------------------------------
 
-proc createStateStore(filePath: string): StateStore =
+proc createStateStore*(filePath: string): StateStore =
   var data: JsonNode = %*{
     "dbVersion": "",
     "dbFileSize": 0,
@@ -209,8 +211,9 @@ proc createStateStore(filePath: string): StateStore =
 # CheatDb namespace
 # ---------------------------------------------------------------------------
 
-proc createCheatDb(archiveFile: string): CheatDb =
+proc createCheatDb*(archiveFile: string): CheatDb =
   var db: DbConn
+  var initialized = false
 
   proc normalizeSystemName(name: string): string =
     ## Strip trailing parenthesized suffix from an archive system name.
@@ -247,6 +250,7 @@ proc createCheatDb(archiveFile: string): CheatDb =
     let cntRows = db.getAllRows(sql"SELECT count(*) as cnt FROM cheats")
     let cnt = parseInt(cntRows[0][0])
     if stored == archiveFile and cnt > 0:
+      initialized = true
       return  # cache hit
 
     # Archive has changed (or DB is empty) - rebuild
@@ -284,26 +288,31 @@ proc createCheatDb(archiveFile: string): CheatDb =
 
     db.exec(sql"INSERT INTO metadata(key,value) VALUES('archive_file', ?)", archiveFile)
     db.exec(sql"COMMIT")
+    initialized = true
 
   proc getSystems(): seq[string] =
+    if not initialized: return @[]
     let rows = db.getAllRows(sql"SELECT name FROM systems ORDER BY name COLLATE NOCASE")
     result = @[]
     for row in rows:
       result.add(row[0])
 
   proc getAllCheats(system: string): seq[int] =
+    if not initialized: return @[]
     let rows = db.getAllRows(sql"SELECT id FROM cheats WHERE system=? ORDER BY name COLLATE NOCASE", system)
     result = @[]
     for row in rows:
       result.add(row[0].parseInt)
 
   proc getCheatName(id: int): string =
+    if not initialized: return ""
     let rows = db.getAllRows(sql"SELECT name FROM cheats WHERE id=?", id)
     if rows.len == 0:
       return ""
     return rows[0][0]
 
   proc extractCheat(id: int, targetFile: string): bool =
+    if not initialized: return false
     let rows = db.getAllRows(sql"SELECT path FROM cheats WHERE id=?", id)
     if rows.len == 0:
       return false
@@ -511,7 +520,7 @@ proc createUi(textui: bool): Ui =
 # Helper Functions
 # ---------------------------------------------------------------------------
 
-proc stripBracketed(s: string, open, close: char): string =
+proc stripBracketed*(s: string, open, close: char): string =
   ## Remove all instances of open..close (including preceding whitespace).
   result = ""
   var i = 0
@@ -529,7 +538,7 @@ proc stripBracketed(s: string, open, close: char): string =
       result.add(s[i])
     inc i
 
-proc normalizeTitle(s: string): string =
+proc normalizeTitle*(s: string): string =
   ## Strip file extension, parenthesized text, bracketed text,
   ## then keep only lowercase alphanumerics.
   var r = s
@@ -546,7 +555,7 @@ proc normalizeTitle(s: string): string =
     if c.isAlphaNumeric: filtered.add(c)
   return filtered.toLowerAscii()
 
-proc formatCheatDisplay(filename: string): string =
+proc formatCheatDisplay*(filename: string): string =
   ## Format a cheat filename with [TOOL|REGION] badge prefix.
   ## Recognized tool/region groups are stripped; unrecognized groups stay in the title.
   ## "Castlevania (Action Replay) (USA).cht"  -> "[AR|US] Castlevania"
@@ -741,7 +750,7 @@ proc downloadFile(url, outputPath: string): bool =
 # Browser Logic
 # ---------------------------------------------------------------------------
 
-proc extractTag(dirName: string): string =
+proc extractTag*(dirName: string): string =
   ## Extract the system tag from a ROM directory name.
   if dirName.len > 0 and dirName.allCharsInSet({'A'..'Z', '0'..'9'}):
     return dirName
@@ -751,7 +760,7 @@ proc extractTag(dirName: string): string =
       return dirName[p + 1 .. ^2]
   return ""
 
-proc hasGameFiles(dirPath: string): bool =
+proc hasGameFiles*(dirPath: string): bool =
   for path in walkDirRec(dirPath):
     let name = extractFilename(path)
     if name.startsWith("."): continue
@@ -760,11 +769,11 @@ proc hasGameFiles(dirPath: string): bool =
       return true
   return false
 
-proc browserListDirs(): seq[DirEntry] =
+proc browserListDirs*(rootDir: string): seq[DirEntry] =
   ## List ROM subdirectories that have a parseable tag and contain game files.
   result = @[]
   var entries: seq[string] = @[]
-  for kind, path in walkDir(env.romDir):
+  for kind, path in walkDir(rootDir):
     if kind == pcDir:
       entries.add(path)
   entries.sort(proc(a, b: string): int = cmpIgnoreCase(extractFilename(a),
@@ -776,7 +785,7 @@ proc browserListDirs(): seq[DirEntry] =
     if not hasGameFiles(d): continue
     result.add(DirEntry(name: name, path: d))
 
-proc browserListGames(dirPath: string): seq[DirEntry] =
+proc browserListGames*(dirPath: string): seq[DirEntry] =
   ## List game files within a ROM directory.
   ## Handles plain files, .m3u playlists inside subdirectories,
   ## and subdirectories containing valid game files.
@@ -823,6 +832,29 @@ proc browserListGames(dirPath: string): seq[DirEntry] =
 
         if validGameFound:
           result.add(DirEntry(name: name, path: f))
+
+proc isCheatZip*(path: string): bool =
+  try:
+    let entries = mzListArchive(path)
+    for e in entries:
+      let ci = e.find("cht/")
+      if ci >= 0 and e.find('/', ci + 4) >= 0:
+        return true
+  except:
+    discard
+  return false
+
+proc findLocalCheatZip*(sdcardPath: string): string =
+  if sdcardPath == "":
+    return ""
+  try:
+    for kind, path in walkDir(sdcardPath):
+      if kind == pcFile and path.toLowerAscii().endsWith(".zip"):
+        if isCheatZip(path):
+          return path
+  except:
+    discard
+  return ""
 
 proc ensureDirs() =
   createDir(env.cacheDir)
@@ -898,23 +930,32 @@ proc main() =
     selectedCheatId = 0
 
   var exitCode = 0
-  var state = CHECK_UPDATE
+  var state = FIND_LOCAL_DB
 
   while state != EXIT:
     case state
 
+    of FIND_LOCAL_DB:
+      let localZip = findLocalCheatZip(getEnv("SDCARD_PATH"))
+      if localZip != "":
+        let dbFile = env.cacheDir / "cheats.zip"
+        copyFile(localZip, dbFile)
+        stateStore.setCheatDbVersion("local", getFileSize(dbFile))
+        state = INIT_DB
+      else:
+        state = CHECK_UPDATE
+
     of CHECK_UPDATE:
-      ui.message("Checking for updates...")
-      latestVersion = checkUpdate()
+      if not offlineMode:
+        ui.message("Checking for updates...")
+        latestVersion = checkUpdate()
       currentVersion = stateStore.getCheatDbVersion()
       let dbFile = env.cacheDir / "cheats.zip"
       if currentVersion != "" and stateStore.isDbFileMissing(dbFile):
         currentVersion = ""
         stateStore.setCheatDbVersion("")
       if currentVersion == "" and latestVersion == "":
-        ui.message("Can't download database from GitHub. Exiting.", 3)
-        exitCode = 1
-        state = EXIT
+        state = INIT_DB
       elif currentVersion == "":
         state = CONFIRM_DOWNLOAD
       elif latestVersion != "" and latestVersion != currentVersion:
@@ -956,12 +997,18 @@ proc main() =
         state = INIT_DB
 
     of INIT_DB:
+      let dbFile = env.cacheDir / "cheats.zip"
+      if not fileExists(dbFile):
+        ui.message("No cheat database available. Exiting.", 3)
+        exitCode = 1
+        state = EXIT
+        continue
       ui.message("Checking cheat archive...")
-      cheatDb = createCheatDb(env.cacheDir / "cheats.zip")
+      cheatDb = createCheatDb(dbFile)
       state = SELECT_GAME_FOLDER
 
     of SELECT_GAME_FOLDER:
-      let dirs = browserListDirs()
+      let dirs = browserListDirs(env.romDir)
       if dirs.len == 0:
         ui.message("No supported ROM folders found. Check that your ROM folders use the 'System (TAG)' naming convention.", 5)
         state = EXIT
@@ -1191,6 +1238,8 @@ when isMainModule:
       textui = true
     elif arg == "debug":
       debugMode = true
+    elif arg == "offline":
+      offlineMode = true
 
   # Check for required environment variables
   env.romDir = getEnv("ROM_DIR")
