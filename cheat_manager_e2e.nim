@@ -1,6 +1,6 @@
 import unittest, osproc, os, streams, json, strtabs, strutils, sequtils
 
-const BINARY {.strdefine.} = currentSourcePath().parentDir() / "cheat_manager"
+let   BINARY   = getEnv("CHEAT_MANAGER_BIN", getAppDir() / "cheat_manager")
 const FIXTURES = currentSourcePath().parentDir() / "test" / "fixtures"
 
 # ---------------------------------------------------------------------------

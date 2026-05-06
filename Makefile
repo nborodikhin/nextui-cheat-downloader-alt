@@ -1,44 +1,37 @@
-NIM        ?= nim
-BINARY      = cheat_manager
-BINARY_COV  = cheat_manager_cov
-MINIZ_VER  ?= 3.1.1
-MINIZ_FLAGS = -d:minizDir=workspace/miniz-$(MINIZ_VER) --passC:-Iworkspace/miniz-$(MINIZ_VER)
-NIMCACHE    = nimcache
+NIM      ?= nim
+BINARY    = cheat_manager
+NIMCACHE  = nimcache
 
 ifdef COVERAGE
-COV_FLAGS  = --passC:--coverage --passL:--coverage --lineDir:on --nimcache:$(NIMCACHE)
-E2E_DEP    = $(BINARY_COV)
-E2E_FLAGS  = -d:BINARY=$(CURDIR)/$(BINARY_COV)
+COV_FLAGS = --passC:--coverage --passL:--coverage --lineDir:on
 else
-COV_FLAGS  =
-E2E_DEP    = $(BINARY)
-E2E_FLAGS  =
+COV_FLAGS =
 endif
 
 GCOVR_FLAGS = --filter cheat_manager.nim --gcov-ignore-errors=no_working_dir_found
 GCDA        = $(NIMCACHE)/@mcheat_manager.nim.c.gcda
 
+BINARIES = cheat_manager cheat_manager_test cheat_manager_e2e
+
 .PHONY: all build test test-e2e test-all coverage launch-test clean
 
 all: build
 
-build:
-	./build-binary.sh host debug
+build: cheat_manager
 
-test:
-	$(NIM) c $(COV_FLAGS) -r --path:. $(MINIZ_FLAGS) cheat_manager_test.nim
+$(BINARIES): %: %.nim
+	SOURCE=$< EXTRA_NIM_FLAGS="$(COV_FLAGS)" ./build-binary.sh host debug
 
-$(BINARY_COV): cheat_manager.nim
-	$(NIM) c --passC:--coverage --passL:--coverage --lineDir:on --path:. $(MINIZ_FLAGS) --nimcache:$(NIMCACHE) -o:$(BINARY_COV) cheat_manager.nim
+test: cheat_manager_test
+	./cheat_manager_test
 
-test-e2e: $(E2E_DEP)
-	$(NIM) c -r --path:. $(MINIZ_FLAGS) $(E2E_FLAGS) cheat_manager_e2e.nim
+test-e2e: cheat_manager cheat_manager_e2e
+	CHEAT_MANAGER_BIN=./cheat_manager ./cheat_manager_e2e
 
 test-all: test test-e2e
 
 coverage:
-	rm -rf $(NIMCACHE)
-	$(MAKE) test test-e2e COVERAGE=true
+	$(MAKE) clean test test-e2e COVERAGE=true
 	mkdir -p coverage
 	gcovr $(GCOVR_FLAGS) $(GCDA) --print-summary
 	gcovr $(GCOVR_FLAGS) $(GCDA) --html --html-details -o coverage/index.html
@@ -47,4 +40,5 @@ launch-test: build
 	./launch-test.sh
 
 clean:
-	rm -f $(BINARY) $(BINARY_COV) cheat_manager_test cheat_manager_e2e
+	rm -rf $(NIMCACHE)
+	rm -f $(BINARIES)

@@ -31,6 +31,7 @@ NIM_FLAGS="--threads:off -d:minizDir=workspace/miniz-${MINIZ_VER} --passC:-Iwork
 if [ "$BUILD_TYPE" = "release" ]; then
   NIM_FLAGS="$NIM_FLAGS -d:release -d:strip --opt:size -d:lto --passC:-fno-strict-aliasing --passL:-fno-strict-aliasing --passL:-Wno-lto-type-mismatch"
 fi
+NIM_FLAGS="$NIM_FLAGS ${EXTRA_NIM_FLAGS:-}"
 
 echorun () {
   echo "$@"
@@ -57,7 +58,7 @@ for platform in $TARGETS; do
   echo "Building $platform $BUILD_TYPE"
 
   if [ "$platform" = "host" ]; then
-    echorun nim c $NIM_FLAGS -o:cheat_manager cheat_manager.nim
+    echorun nim c $NIM_FLAGS --nimcache:nimcache ${SOURCE:-cheat_manager.nim}
   else
     BUILD_SCRIPT=workspace/buildbin.sh
     NIMCACHE=nimcache
