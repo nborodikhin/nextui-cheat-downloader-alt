@@ -225,17 +225,23 @@ proc createCheatDb*(archiveFile: string): CheatDb =
 
   proc init() =
     if not fileExists(archiveFile):
-      ## TODO - throw exception
       return
 
     let dbFile = archiveFile.changeFileExt(".db")
 
-    try:
-      db = open(dbFile, "", "", "")
-    except:
-      ## TODO - throw exception
-      echo "Error opening database: ", getCurrentExceptionMsg()
-      return
+    # Try to open DB file. Error recovery: delete corrupt file and rebuild from archive.
+    let maxTries = 2
+    var tries = 0
+    while true:
+      inc tries
+      try:
+        db = open(dbFile, "", "", "")
+        break
+      except:
+        stderr.writeLine("cheat_manager: db open failed: ", getCurrentExceptionMsg())
+        if tries >= maxTries:
+          raise newException(IOError, "Error opening cheat database: " & getCurrentExceptionMsg())
+        try: removeFile(dbFile) except: discard
 
     db.exec(sql"CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
     db.exec(sql"CREATE TABLE IF NOT EXISTS systems (name TEXT PRIMARY KEY)")
@@ -1048,7 +1054,13 @@ proc main() =
         state = EXIT
         continue
       ui.message("Checking cheat archive...")
-      cheatDb = createCheatDb(dbFile)
+      try:
+        cheatDb = createCheatDb(dbFile)
+      except IOError:
+        ui.message("Failed to open cheat database. Exiting.", 5)
+        exitCode = 1
+        state = EXIT
+        continue
       state = SELECT_GAME_FOLDER
 
     of SELECT_GAME_FOLDER:
