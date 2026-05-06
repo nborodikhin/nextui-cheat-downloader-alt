@@ -8,7 +8,7 @@ else
 COV_FLAGS =
 endif
 
-GCOVR_FLAGS = --filter cheat_manager.nim --gcov-ignore-errors=no_working_dir_found
+GCOVR_FLAGS = --filter cheat_manager.nim --gcov-ignore-errors=no_working_dir_found --gcov-ignore-errors=source_not_found --object-directory $(NIMCACHE)
 GCDA        = $(NIMCACHE)/@mcheat_manager.nim.c.gcda
 
 BINARIES = cheat_manager cheat_manager_test cheat_manager_e2e
