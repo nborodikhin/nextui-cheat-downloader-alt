@@ -7,20 +7,20 @@ const FIXTURES = currentSourcePath().parentDir() / "test" / "fixtures"
 # Harness
 # ---------------------------------------------------------------------------
 
-proc makeEnv(romDir, cacheDir, cheatDir: string): StringTableRef =
+proc makeEnv(romDir, cacheDir, cheatDir: string; sdcardPath = ""): StringTableRef =
   result = newStringTable(modeStyleInsensitive)
   for k, v in envPairs():
     result[k] = v
   result["ROM_DIR"]    = romDir
   result["CACHE_DIR"]  = cacheDir
   result["CHEAT_DIR"]  = cheatDir
-  result["SDCARD_PATH"] = ""
+  result["SDCARD_PATH"] = sdcardPath
 
-proc runScenario(romDir, cacheDir, cheatDir: string,
-                 choices: seq[JsonNode]): (seq[JsonNode], int) =
+proc runScenario(romDir, cacheDir, cheatDir: string;
+                 choices: seq[JsonNode]; sdcardPath = ""): (seq[JsonNode], int) =
   let p = startProcess(BINARY,
                        args = ["jsonui", "offline"],
-                       env = makeEnv(romDir, cacheDir, cheatDir),
+                       env = makeEnv(romDir, cacheDir, cheatDir, sdcardPath),
                        options = {poUsePath})
   let inp  = p.inputStream()
   let outp = p.outputStream()
@@ -291,3 +291,55 @@ suite "e2e — MAP_SYSTEM":
         tmp / "roms", tmp / "cache", tmp / "roms", choices)
       check code == 0
       check listTitles(events).count("Select Game Folder") == 2
+
+# ---------------------------------------------------------------------------
+
+suite "e2e — m3u playlists":
+
+  test "m3u file inside subdir is listed and cheat installs correctly":
+    withE2eEnv(tmp):
+      createDir(tmp / "roms" / "Game Boy (GB)" / "Tetris")
+      writeFile(tmp / "roms" / "Game Boy (GB)" / "Tetris" / "Tetris (World).m3u", "")
+      let choices = @[
+        %*{"choice": 0},   # folder: Game Boy (GB)
+        %*{"choice": 0},   # game: Tetris (World).m3u (from subdir)
+        %*{"choice": 0},   # cheat: Tetris (World) [WD]
+        %*{"choice": -1},
+        %*{"choice": -1},
+      ]
+      let (events, code) = runScenario(
+        tmp / "roms", tmp / "cache", tmp / "roms", choices)
+      check code == 0
+      # cheat is named after the m3u file, installed in the ROM folder
+      check fileExists(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).m3u.cht")
+      check hasMessage(events, "Installed to")
+
+# ---------------------------------------------------------------------------
+
+suite "e2e — predownloaded cheat zip":
+
+  test "cheat zip found on SDCARD_PATH is used without downloading":
+    let tmp = getTempDir() / "e2e_sdcard_" & $getCurrentProcessId()
+    createDir(tmp / "roms")
+    createDir(tmp / "cache")   # intentionally empty — no pre-copied zip
+    createDir(tmp / "cheats")
+    createDir(tmp / "sdcard")
+    copyFile(FIXTURES / "cheats.zip", tmp / "sdcard" / "cheats.zip")
+    createDir(tmp / "roms" / "Game Boy (GB)")
+    writeFile(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).gb", "")
+    try:
+      let choices = @[
+        %*{"choice": 0},
+        %*{"choice": 0},
+        %*{"choice": 0},
+        %*{"choice": -1},
+        %*{"choice": -1},
+      ]
+      let (events, code) = runScenario(
+        tmp / "roms", tmp / "cache", tmp / "roms", choices,
+        sdcardPath = tmp / "sdcard")
+      check code == 0
+      check fileExists(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).gb.cht")
+      check hasMessage(events, "Installed to")
+    finally:
+      removeDir(tmp)
