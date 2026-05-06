@@ -3,7 +3,7 @@ BINARY      = cheat_manager
 MINIZ_VER  ?= 3.1.1
 MINIZ_FLAGS = -d:minizDir=workspace/miniz-$(MINIZ_VER) --passC:-Iworkspace/miniz-$(MINIZ_VER)
 
-.PHONY: all build test coverage launch-test clean
+.PHONY: all build test test-e2e test-all coverage launch-test clean
 
 all: build
 
@@ -21,6 +21,11 @@ coverage:
 	mkdir -p coverage
 	gcovr --filter cheat_manager.nim --gcov-ignore-errors=no_working_dir_found $(NIMCACHE)/@mcheat_manager.nim.c.gcda --print-summary
 	gcovr --filter cheat_manager.nim --gcov-ignore-errors=no_working_dir_found $(NIMCACHE)/@mcheat_manager.nim.c.gcda --html --html-details -o coverage/index.html
+
+test-e2e: $(BINARY)
+	$(NIM) c -r --path:. $(MINIZ_FLAGS) cheat_manager_e2e.nim
+
+test-all: test test-e2e
 
 launch-test: build
 	./launch-test.sh

@@ -157,6 +157,12 @@ suite "hasGameFiles":
       writeFile(tmp / ".game.zip", "")
       check hasGameFiles(tmp) == false
 
+  test "game file inside hidden subdir — excluded":
+    withTempDir(tmp):
+      createDir(tmp / ".hidden")
+      writeFile(tmp / ".hidden" / "game.gb", "")
+      check hasGameFiles(tmp) == false
+
   test "empty directory":
     withTempDir(tmp):
       check hasGameFiles(tmp) == false
@@ -279,6 +285,48 @@ suite "browserListGames":
       createDir(sub)
       writeFile(sub / "readme.txt", "")
       check browserListGames(tmp).len == 0
+
+  test "result is sorted alphabetically":
+    withTempDir(tmp):
+      writeFile(tmp / "Sonic the Hedgehog (USA).zip", "")
+      writeFile(tmp / "Alex Kidd in Miracle World (USA).zip", "")
+      writeFile(tmp / "Alex Kidd in Shinobi World (USA, Europe).zip", "")
+      let games = browserListGames(tmp)
+      check games.len == 3
+      check games[0].name == "Alex Kidd in Miracle World (USA).zip"
+      check games[1].name == "Alex Kidd in Shinobi World (USA, Europe).zip"
+      check games[2].name == "Sonic the Hedgehog (USA).zip"
+
+# ---------------------------------------------------------------------------
+
+suite "cheat display sort order":
+  test "plain title sorts before Rev-1 suffixed title":
+    # '(' ASCII 40 < '[' ASCII 91, so naive cmpIgnoreCase puts "(Rev 1) [US]"
+    # before "[US]" — wrong. Sort by title-before-badge as primary key.
+    let plain = formatCheatDisplay("Alex Kidd in Miracle World (USA).cht")
+    let rev1  = formatCheatDisplay("Alex Kidd in Miracle World (Rev 1) (USA).cht")
+    check plain == "Alex Kidd in Miracle World [US]"
+    check rev1  == "Alex Kidd in Miracle World (Rev 1) [US]"
+    # naive sort is wrong: '[' > '(' so plain sorts after rev1
+    check cmpIgnoreCase(plain, rev1) > 0
+    # sort by title part (before trailing ' [') is correct
+    proc titleKey(s: string): string =
+      let i = s.rfind(" ["); if i >= 0: s[0 ..< i] else: s
+    check cmpIgnoreCase(titleKey(plain), titleKey(rev1)) < 0
+
+  test "same title: tool badges sort among themselves by badge text":
+    let ar = formatCheatDisplay("Castlevania (Action Replay) (USA).cht")
+    let gs = formatCheatDisplay("Castlevania (GameShark) (USA).cht")
+    let us = formatCheatDisplay("Castlevania (USA).cht")
+    check ar == "Castlevania [AR|US]"
+    check gs == "Castlevania [GS|US]"
+    check us == "Castlevania [US]"
+    proc titleKey(s: string): string =
+      let i = s.rfind(" ["); if i >= 0: s[0 ..< i] else: s
+    check titleKey(ar) == titleKey(gs)
+    check titleKey(gs) == titleKey(us)
+    check cmpIgnoreCase(ar, gs) < 0
+    check cmpIgnoreCase(gs, us) < 0
 
 # ---------------------------------------------------------------------------
 
@@ -424,15 +472,17 @@ suite "createCheatDb":
       copyFile(FIXTURES / "cheats.zip", arch)
       let db = createCheatDb(arch)
       let ids = db.getAllCheats("Nintendo - Game Boy")
-      check ids.len == 1
+      check ids.len == 2
 
   test "getCheatName returns correct name":
     withTempDir(tmp):
       let arch = tmp / "cheats.zip"
       copyFile(FIXTURES / "cheats.zip", arch)
       let db = createCheatDb(arch)
+      # getAllCheats returns ORDER BY name NOCASE: Kirby first, then Tetris
       let ids = db.getAllCheats("Nintendo - Game Boy")
-      check db.getCheatName(ids[0]) == "Tetris (World).cht"
+      check db.getCheatName(ids[0]) == "Kirby's Dream Land (USA, Europe).cht"
+      check db.getCheatName(ids[1]) == "Tetris (World).cht"
 
   test "cache hit: second init skips rebuild":
     withTempDir(tmp):

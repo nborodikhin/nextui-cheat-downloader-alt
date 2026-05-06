@@ -339,7 +339,7 @@ proc createCheatDb*(archiveFile: string): CheatDb =
 # UI namespace
 # ---------------------------------------------------------------------------
 
-proc createUi(textui: bool): Ui =
+proc createMinuiUi(): UI =
   var presenterPid: int = 0
 
   proc killPresenter(signal: cint = SIGKILL, cleanup: bool = true) =
@@ -351,16 +351,9 @@ proc createUi(textui: bool): Ui =
         discard posix.waitpid(Pid(presenterPid), status, 0)
         presenterPid = 0
 
-  proc messageText(text: string, timeout: int) =
-    echo ""
-    echo "-".repeat(40)
-    echo "MESSAGE: ", text
-    echo "-".repeat(40)
-    echo ""
-    if timeout > 0:
-      sleep(timeout * 1000)
-
-  proc messageUi(text: string, timeout: int) =
+  proc message(text: string, timeout: int) =
+    killPresenter()
+    debug "message: ", text, ", timeout ", $timeout
     if timeout <= 0:
       let p = startProcess(CMD_MINUI_PRESENTER,
                           args = ["--message", text, "--timeout", "-1"],
@@ -375,139 +368,67 @@ proc createUi(textui: bool): Ui =
       except:
         discard
 
-  proc message(text: string, timeout: int = 0) =
+  proc messages(lines: seq[string], timeout: int) =
     killPresenter()
-    debug "message: ", text, ", timeout ", $timeout
-    if textui: messageText(text, timeout)
-    else: messageUi(text, timeout)
-
-  proc messagesText(lines: seq[string], timeout: int = 86400) =
-    let first = lines[0]
-    let rest = lines.len - 1
-    if rest > 0: echo "MESSAGE: ", first, ", ", $rest, " more lines"
-    else: echo "MESSAGE: ", first
-
-  proc messagesUi(lines: seq[string], timeout: int = 86400) =
+    killPresenter()
+    debug "messages: ", $lines.len, " lines"
     let jsonFile = env.cacheDir / "messages.json"
     var items = newJArray()
     for line in lines:
       items.add(%*{"text": line})
     let data = %*{"items": items}
     writeFile(jsonFile, $data)
-
     let p = startProcess(CMD_MINUI_PRESENTER,
                         args = ["--file", jsonFile, "--disable-auto-sleep",
                                 "--timeout", $timeout],
                         options = {poUsePath})
     presenterPid = p.processID
 
-  proc messages(lines: seq[string], timeout: int = 86400) =
-    killPresenter()
-    killPresenter()
-    debug "messages: ", $lines.len, " lines"
-    if textui: messagesText(lines, timeout)
-    else: messagesUi(lines, timeout)
-
   proc nextMessage() =
     killPresenter(SIGUSR1, false)
 
-  proc confirm(text: string, confirmText: string = "Yes",
-                cancelText: string = "No"): bool =
+  proc confirm(text: string, confirmText: string, cancelText: string): bool =
     killPresenter()
-    if textui:
-      echo ""
-      echo "CONFIRM: ", text, " (y/n)"
-      stdout.flushFile()
-      let input = stdin.readLine()
-      return input.toLowerAscii() == "y"
-    else:
-      let args = ["--message", text,
-                  "--confirm-button", "A",
-                  "--confirm-text", confirmText,
-                  "--confirm-show",
-                  "--cancel-button", "B",
-                  "--cancel-text", cancelText,
-                  "--cancel-show",
-                  "--timeout", "0"]
-      let (_, exitCode) = execCmdRaw(CMD_MINUI_PRESENTER, args)
-      return exitCode == 0
+    let args = ["--message", text,
+                "--confirm-button", "A",
+                "--confirm-text", confirmText,
+                "--confirm-show",
+                "--cancel-button", "B",
+                "--cancel-text", cancelText,
+                "--cancel-show",
+                "--timeout", "0"]
+    let (_, exitCode) = execCmdRaw(CMD_MINUI_PRESENTER, args)
+    return exitCode == 0
 
-  proc listText(title: string, items: seq[string],
-              selectedIndex: int = 0): int =
-    echo ""
-    echo "=== ", title, " ==="
-
-    let maxNum = items.len
-    let numWidth = ($maxNum).len
-
-    for i, item in items:
-      let displayNum = i + 1
-      let paddedNum = align($displayNum, numWidth)
-      let prefix = if i == selectedIndex: "->" & paddedNum & "."
-                  else: "  " & paddedNum & "."
-      echo prefix, " ", item
-
-    echo "Enter selection (Enter for current, 'q' to cancel):"
-    stdout.flushFile()
-    let input = stdin.readLine()
-
-    if input == "":
-      return selectedIndex
-
-    try:
-      let num = parseInt(input)
-      if num < 1 or num > items.len:
-        return -1
-      # indices are one-based
-      return num - 1
-    except:
-      return -1
-
-  proc listUi(title: string, items: seq[string],
-              selectedIndex: int = 0): int =
+  proc list(title: string, items: seq[string], selectedIndex: int): int =
     let jsonFile = env.cacheDir / "list.json"
-
     var minuiItems = newJArray()
     for item in items:
       minuiItems.add(%*{"name": item})
-
     let data = %*{"items": minuiItems, "selected": selectedIndex}
     writeFile(jsonFile, $data)
-
     killPresenter()
     let outFile = env.cacheDir / "list_result.json"
     try:
       removeFile(outFile)
     except:
       discard
-
     let args = ["--file", jsonFile, "--item-key", "items",
                 "--title", title, "--write-location", outFile,
                 "--write-value", "state"]
     let (_, exitCode) = execCmdRaw(CMD_MINUI_LIST, args)
-
     if exitCode != 0:
-      return -1  # Cancel
-
+      return -1
     if not fileExists(outFile):
       return -1
-
     let content = readFile(outFile)
     let resultJson = parseJson(content)
     let selIdx = resultJson["selected"].getInt(-1)
-    if selIdx < 0:
-      return -1
-
     if selIdx >= 0 and selIdx < items.len:
       return selIdx
     return -1
 
-  proc list(title: string, items: seq[string],
-              selectedIndex: int): int =
-    if textui: return listText(title, items, selectedIndex)
-    else: return listUi(title, items, selectedIndex)
-
-  result = Ui(
+  result = UI(
     killPresenter: killPresenter,
     message: message,
     messages: messages,
@@ -515,6 +436,124 @@ proc createUi(textui: bool): Ui =
     confirm: confirm,
     list: list,
   )
+
+proc createTextUi(): UI =
+  var msgLines: seq[string] = @[]
+  var msgIdx: int = 0
+
+  proc killPresenter(signal: cint = SIGKILL, cleanup: bool = true) = discard
+
+  proc message(text: string, timeout: int) =
+    echo ""
+    echo "-".repeat(40)
+    echo "MESSAGE: ", text
+    echo "-".repeat(40)
+    echo ""
+    if timeout > 0:
+      sleep(timeout * 1000)
+
+  proc messages(lines: seq[string], timeout: int) =
+    msgLines = lines
+    msgIdx = 0
+    message(lines[0], 0)
+
+  proc nextMessage() =
+    if msgLines.len > 0:
+      msgIdx = (msgIdx + 1) mod msgLines.len
+      message(msgLines[msgIdx], 0)
+
+  proc confirm(text: string, confirmText: string, cancelText: string): bool =
+    echo ""
+    echo "CONFIRM: ", text, " (y/n)"
+    stdout.flushFile()
+    let input = stdin.readLine()
+    return input.toLowerAscii() == "y"
+
+  proc list(title: string, items: seq[string], selectedIndex: int): int =
+    echo ""
+    echo "=== ", title, " ==="
+    let maxNum = items.len
+    let numWidth = ($maxNum).len
+    for i, item in items:
+      let displayNum = i + 1
+      let paddedNum = align($displayNum, numWidth)
+      let prefix = if i == selectedIndex: "->" & paddedNum & "."
+                  else: "  " & paddedNum & "."
+      echo prefix, " ", item
+    echo "Enter selection (Enter for current, 'q' to cancel):"
+    stdout.flushFile()
+    let input = stdin.readLine()
+    if input == "":
+      return selectedIndex
+    try:
+      let num = parseInt(input)
+      if num < 1 or num > items.len:
+        return -1
+      return num - 1
+    except:
+      return -1
+
+  result = UI(
+    killPresenter: killPresenter,
+    message: message,
+    messages: messages,
+    nextMessage: nextMessage,
+    confirm: confirm,
+    list: list,
+  )
+
+proc createJsonUi(): UI =
+  var msgLines: seq[string] = @[]
+  var msgIdx: int = 0
+
+  proc killPresenter(signal: cint = SIGKILL, cleanup: bool = true) = discard
+
+  proc message(text: string, timeout: int) =
+    echo $(%*{"type": "message", "text": text})
+    stdout.flushFile()
+
+  proc messages(lines: seq[string], timeout: int) =
+    msgLines = lines
+    msgIdx = 0
+    if lines.len > 0:
+      echo $(%*{"type": "message", "text": lines[0]})
+      stdout.flushFile()
+
+  proc nextMessage() =
+    if msgLines.len > 0:
+      msgIdx = (msgIdx + 1) mod msgLines.len
+      echo $(%*{"type": "message", "text": msgLines[msgIdx]})
+      stdout.flushFile()
+
+  proc confirm(text: string, confirmText: string, cancelText: string): bool =
+    echo $(%*{"type": "confirm", "text": text,
+              "confirm": confirmText, "cancel": cancelText})
+    stdout.flushFile()
+    let line = stdin.readLine()
+    return parseJson(line)["choice"].getBool(false)
+
+  proc list(title: string, items: seq[string], selectedIndex: int): int =
+    var jItems = newJArray()
+    for item in items: jItems.add(%item)
+    echo $(%*{"type": "list", "title": title, "items": jItems,
+              "selected": selectedIndex})
+    stdout.flushFile()
+    let line = stdin.readLine()
+    return parseJson(line)["choice"].getInt(-1)
+
+  result = UI(
+    killPresenter: killPresenter,
+    message: message,
+    messages: messages,
+    nextMessage: nextMessage,
+    confirm: confirm,
+    list: list,
+  )
+
+proc createUi(textui, jsonui: bool): UI =
+  if jsonui: createJsonUi()
+  elif textui: createTextUi()
+  else: createMinuiUi()
 
 # ---------------------------------------------------------------------------
 # Helper Functions
@@ -762,9 +801,10 @@ proc extractTag*(dirName: string): string =
 
 proc hasGameFiles*(dirPath: string): bool =
   for path in walkDirRec(dirPath):
-    let name = extractFilename(path)
-    if name.startsWith("."): continue
-    let ext = splitFile(name).ext.toLowerAscii()
+    let rel = path[dirPath.len .. ^1]
+    if "/." in rel or rel.startsWith("."):
+      continue
+    let ext = splitFile(path).ext.toLowerAscii()
     if ext notin EXCLUDED_EXTS:
       return true
   return false
@@ -855,6 +895,10 @@ proc findLocalCheatZip*(sdcardPath: string): string =
   except:
     discard
   return ""
+
+proc cheatSortKey(display: string): string =
+  let i = display.rfind(" [")
+  if i >= 0: display[0 ..< i] else: display
 
 proc ensureDirs() =
   createDir(env.cacheDir)
@@ -1144,7 +1188,9 @@ proc main() =
       var pairs: seq[(string, int)] = @[]
       for cid in allMatches:
         pairs.add((formatCheatDisplay(cheatDb.getCheatName(cid)), cid))
-      pairs.sort(proc(a, b: (string, int)): int = cmpIgnoreCase(a[0], b[0]))
+      pairs.sort(proc(a, b: (string, int)): int =
+        let c = cmpIgnoreCase(cheatSortKey(a[0]), cheatSortKey(b[0]))
+        if c != 0: c else: cmpIgnoreCase(a[0], b[0]))
       var cheatItems: seq[string] = @[]
       var sortedMatchIds: seq[int] = @[]
       for (name, cid) in pairs:
@@ -1175,7 +1221,9 @@ proc main() =
       var pairs: seq[(string, int)] = @[]
       for cid in allIds:
         pairs.add((formatCheatDisplay(cheatDb.getCheatName(cid)), cid))
-      pairs.sort(proc(a, b: (string, int)): int = cmpIgnoreCase(a[0], b[0]))
+      pairs.sort(proc(a, b: (string, int)): int =
+        let c = cmpIgnoreCase(cheatSortKey(a[0]), cheatSortKey(b[0]))
+        if c != 0: c else: cmpIgnoreCase(a[0], b[0]))
       var cheatItems: seq[string] = @[]
       var sortedAllIds: seq[int] = @[]
       for (name, cid) in pairs:
@@ -1233,9 +1281,12 @@ proc main() =
 when isMainModule:
   # Check arguments
   var textui = false
+  var jsonuiMode = false
   for arg in commandLineParams():
     if arg == "textui":
       textui = true
+    elif arg == "jsonui":
+      jsonuiMode = true
     elif arg == "debug":
       debugMode = true
     elif arg == "offline":
@@ -1262,6 +1313,6 @@ when isMainModule:
   debug "CACHE_DIR: ", env.cacheDir
   debug "CHEAT_DIR: ", env.cheatDir
 
-  ui = createUi(textui)
+  ui = createUi(textui, jsonuiMode)
 
   main()
