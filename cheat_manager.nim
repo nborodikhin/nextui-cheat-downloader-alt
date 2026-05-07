@@ -1087,12 +1087,8 @@ proc main() =
       dirName = selectedDir.name
       stateStore.setLastFolder(dirName)
       tag = extractTag(dirName)
-      if tag == "":
-        ui.message("Could not detect tag for '" & dirName & "'", 2)
-        state = SELECT_GAME_FOLDER
-      else:
-        mappedSystem = stateStore.getSystem(tag)
-        state = SELECT_GAME
+      mappedSystem = stateStore.getSystem(tag)
+      state = SELECT_GAME
 
     of SELECT_GAME:
       let games = browserListGames(dirPath)

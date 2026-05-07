@@ -223,6 +223,49 @@ suite "e2e — Show All Cheats":
       check fileExists(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).gb.cht")
       check hasMessage(events, "Installed to")
 
+  test "Change cheat folder from matched list re-runs FIND_CHEATS":
+    withE2eEnv(tmp):
+      createDir(tmp / "roms" / "Game Boy (GB)")
+      writeFile(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).gb", "")
+      # cheatItems = ["Tetris (World) [WD]", "Show All Cheats", "Change cheat folder"]
+      # changeFolderIdx = 2; MAP_SYSTEM idx 0 = Nintendo - Game Boy
+      let choices = @[
+        %*{"choice": 0},   # folder: Game Boy (GB)
+        %*{"choice": 0},   # game: Tetris (World).gb
+        %*{"choice": 2},   # Change cheat folder → MAP_SYSTEM
+        %*{"choice": 0},   # MAP_SYSTEM: Nintendo - Game Boy
+        %*{"choice": 0},   # cheat: Tetris (World) [WD] (back in matched list)
+        %*{"choice": -1},
+        %*{"choice": -1},
+      ]
+      let (events, code) = runScenario(
+        tmp / "roms", tmp / "cache", tmp / "roms", choices)
+      check code == 0
+      check fileExists(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).gb.cht")
+      check hasMessage(events, "Installed to")
+
+  test "Change cheat folder from full list re-runs FIND_CHEATS":
+    withE2eEnv(tmp):
+      createDir(tmp / "roms" / "Game Boy (GB)")
+      writeFile(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).gb", "")
+      # SELECT_CHEAT_FROM_ALL sorted: ["Kirby's Dream Land [US]", "Tetris (World) [WD]", "Change cheat folder"]
+      # changeFolderIdx = 2
+      let choices = @[
+        %*{"choice": 0},   # folder: Game Boy (GB)
+        %*{"choice": 0},   # game: Tetris (World).gb
+        %*{"choice": 1},   # Show All Cheats → SELECT_CHEAT_FROM_ALL
+        %*{"choice": 2},   # Change cheat folder → MAP_SYSTEM
+        %*{"choice": 0},   # MAP_SYSTEM: Nintendo - Game Boy
+        %*{"choice": 0},   # cheat: Tetris (World) [WD] (back in matched list)
+        %*{"choice": -1},
+        %*{"choice": -1},
+      ]
+      let (events, code) = runScenario(
+        tmp / "roms", tmp / "cache", tmp / "roms", choices)
+      check code == 0
+      check fileExists(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).gb.cht")
+      check hasMessage(events, "Installed to")
+
   test "back from Show All with matches returns to matched list":
     withE2eEnv(tmp):
       createDir(tmp / "roms" / "Game Boy (GB)")
