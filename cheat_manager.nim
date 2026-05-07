@@ -1134,11 +1134,6 @@ proc main() =
 
     of MAP_SYSTEM:
       let systems = cheatDb.getSystems()
-      if systems.len == 0:
-        ui.message("No systems found in database!", 2)
-        state = SELECT_GAME_FOLDER
-        continue
-
       var selectedIdx = 0
       var sysItems: seq[string] = @[]
       for i, s in systems:

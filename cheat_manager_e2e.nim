@@ -296,6 +296,24 @@ suite "e2e — MAP_SYSTEM":
 
 suite "e2e — m3u playlists":
 
+  test "subdir with game files (no m3u) is listed as folder entry":
+    withE2eEnv(tmp):
+      # Disc folder with a CHD but no .m3u — listed as the subdir name
+      createDir(tmp / "roms" / "Game Boy (GB)" / "Tetris (World)")
+      writeFile(tmp / "roms" / "Game Boy (GB)" / "Tetris (World)" / "Tetris (World).chd", "")
+      let choices = @[
+        %*{"choice": 0},   # folder: Game Boy (GB)
+        %*{"choice": 0},   # game: Tetris (World) (subdir name)
+        %*{"choice": 0},   # cheat: Tetris (World) [WD]
+        %*{"choice": -1},
+        %*{"choice": -1},
+      ]
+      let (events, code) = runScenario(
+        tmp / "roms", tmp / "cache", tmp / "roms", choices)
+      check code == 0
+      check fileExists(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).cht")
+      check hasMessage(events, "Installed to")
+
   test "m3u file inside subdir is listed and cheat installs correctly":
     withE2eEnv(tmp):
       createDir(tmp / "roms" / "Game Boy (GB)" / "Tetris")
