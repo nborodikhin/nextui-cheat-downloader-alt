@@ -932,7 +932,7 @@ proc main() =
     (@["BSX"],                   "Nintendo - Satellaview"),
     (@["MD", "GEN", "GENESIS"],  "Sega - Mega Drive - Genesis"),
     (@["GG"],                    "Sega - Game Gear"),
-    (@["MS", "SMS", "SMSGG"],    "Sega - Master System - Mark III"),
+    (@["MS", "SMS", "SMSU", "SMSGG"], "Sega - Master System - Mark III"),
     (@["32X"],                   "Sega - 32X"),
     (@["SS", "SAT"],             "Sega - Saturn"),
     (@["DC"],                    "Sega - Dreamcast"),
@@ -941,7 +941,7 @@ proc main() =
     (@["PSP"],                   "Sony - PlayStation Portable"),
     (@["PCE", "TG16"],           "NEC - PC Engine - TurboGrafx 16"),
     (@["PCECD"],                 "NEC - PC Engine CD - TurboGrafx-CD"),
-    (@["SGFX"],                  "NEC - PC Engine SuperGrafx"),
+    (@["SGFX", "SUPERGRAFX"],    "NEC - PC Engine SuperGrafx"),
     (@["ATARI", "A26", "A2600", "ATARI2600"], "Atari - 2600"),
     (@["LYNX"],                  "Atari - Lynx"),
     (@["A7800", "ATARI7800"],    "Atari - 7800"),
@@ -957,6 +957,10 @@ proc main() =
     (@["PRBOOM"],                "PrBoom"),
     (@["ZX"],                    "Sinclair - ZX Spectrum +3"),
     (@["TIC80"],                 "TIC-80"),
+    (@["NGP"],                   "SNK - Neo Geo Pocket"),
+    (@["NGPC"],                  "SNK - Neo Geo Pocket Color"),
+    (@["SG1000"],                "Sega - SG-1000"),
+    (@["VB"],                    "Nintendo - Virtual Boy"),
   ]
   for (tags, s) in knownMappings:
     for t in tags:
