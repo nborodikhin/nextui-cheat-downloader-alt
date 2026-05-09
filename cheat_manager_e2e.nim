@@ -335,6 +335,30 @@ suite "e2e — MAP_SYSTEM":
       check code == 0
       check listTitles(events).count("Select Game Folder") == 2
 
+  test "stale mapping (system removed from DB) re-prompts MAP_SYSTEM":
+    withE2eEnv(tmp):
+      createDir(tmp / "roms" / "Game Boy (GB)")
+      writeFile(tmp / "roms" / "Game Boy (GB)" / "Tetris.gb", "")
+      # Pre-seed a mapping to a system no longer in the DB
+      writeFile(tmp / "cache" / "state.json",
+        "{\"dbVersion\":\"\",\"dbFileSize\":0,\"lastFolder\":\"\",\"tags\":{\"GB\":\"Obsolete - Removed System\"},\"lastGame\":{}}\n")
+      let choices = @[
+        %*{"choice": 0},   # folder: Game Boy (GB)
+        %*{"choice": 0},   # game: Tetris.gb → FIND_CHEATS → MAP_SYSTEM (stale)
+        %*{"choice": -1},  # back from MAP_SYSTEM
+        %*{"choice": -1},  # back from game
+        %*{"choice": -1},  # exit
+      ]
+      let (events, code) = runScenario(
+        tmp / "roms", tmp / "cache", tmp / "roms", choices)
+      check code == 0
+      var sawMapSystem = false
+      for e in events:
+        if e["type"].getStr() == "list" and "GB" in e["title"].getStr():
+          sawMapSystem = true
+          break
+      check sawMapSystem
+
 # ---------------------------------------------------------------------------
 
 suite "e2e — m3u playlists":
@@ -402,5 +426,6 @@ suite "e2e — predownloaded cheat zip":
       check code == 0
       check fileExists(tmp / "roms" / "Game Boy (GB)" / "Tetris (World).gb.cht")
       check hasMessage(events, "Installed to")
+      check not fileExists(tmp / "sdcard" / "cheats.zip")
     finally:
       removeDir(tmp)

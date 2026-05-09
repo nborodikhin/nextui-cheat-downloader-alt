@@ -36,6 +36,9 @@ This pak is tested on the following NextUI devices:
 2. On first launch, the app downloads the latest Libretro cheat database.
   
     - Note that the download may take a few minutes - the archive is about 160MB
+    - You can also download the latest zip file from
+          the [Libretro database releases](https://github.com/libretro/libretro-database/releases/latest)
+          and put it to the root of your SD card.  The app will use that zip file instead of downloading it again.
     - On later launches it checks for updates and skips the download if your database is already current.
   
 3. **Select a game folder** — the app lists ROM directories on the device. Press `A` to enter one.

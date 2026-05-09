@@ -17,6 +17,7 @@ type
     romDir: string
     cacheDir: string
     cheatDir: string
+    sdcardPath: string
 
   AppState = enum
     FIND_LOCAL_DB
@@ -890,17 +891,26 @@ proc isCheatZip*(path: string): bool =
     discard
   return false
 
-proc findLocalCheatZip*(sdcardPath: string): string =
+proc findLocalCheatZip*(sdcardPath: string): tuple[path, version: string] =
+  const prefix = "libretro-database-"
   if sdcardPath == "":
-    return ""
+    return ("", "")
   try:
     for kind, path in walkDir(sdcardPath):
       if kind == pcFile and path.toLowerAscii().endsWith(".zip"):
         if isCheatZip(path):
-          return path
+          var version = "local"
+          for name in mzListArchive(path):
+            let top = name.split('/')[0]
+            if top.startsWith(prefix):
+              let ver = top[prefix.len .. ^1]
+              if ver.len > 0:
+                version = if ver[0] == 'v': ver else: "v" & ver
+              break
+          return (path, version)
   except:
     discard
-  return ""
+  return ("", "")
 
 proc cheatSortKey(display: string): string =
   let i = display.rfind(" [")
@@ -956,7 +966,7 @@ proc main() =
     (@["DOS"],                   "DOS"),
     (@["PRBOOM"],                "PrBoom"),
     (@["ZX"],                    "Sinclair - ZX Spectrum +3"),
-    (@["TIC80"],                 "TIC-80"),
+    (@["TIC", "TIC80"],          "TIC-80"),
     (@["NGP"],                   "SNK - Neo Geo Pocket"),
     (@["NGPC"],                  "SNK - Neo Geo Pocket Color"),
     (@["SG1000"],                "Sega - SG-1000"),
@@ -987,14 +997,17 @@ proc main() =
   var state = FIND_LOCAL_DB
 
   while state != EXIT:
+    debug "State: ", state
+
     case state
 
     of FIND_LOCAL_DB:
-      let localZip = findLocalCheatZip(getEnv("SDCARD_PATH"))
+      let (localZip, localVersion) = findLocalCheatZip(env.sdcardPath)
       if localZip != "":
         let dbFile = env.cacheDir / "cheats.zip"
-        copyFile(localZip, dbFile)
-        stateStore.setCheatDbVersion("local", getFileSize(dbFile))
+        debug fmt"Moving local zip file: {localZip} -> {dbFile}"
+        moveFile(localZip, dbFile)
+        stateStore.setCheatDbVersion(localVersion, getFileSize(dbFile))
         state = INIT_DB
       else:
         state = CHECK_UPDATE
@@ -1186,8 +1199,7 @@ proc main() =
       if allMatches.len == 0:
         allMatches = tier3
       if allMatches.len == 0:
-        ui.message("No cheats found for this system.", 2)
-        state = SELECT_GAME
+        state = MAP_SYSTEM
       else:
         state = SELECT_CHEAT_FROM_MATCHED
 
@@ -1303,6 +1315,7 @@ when isMainModule:
   env.romDir = getEnv("ROM_DIR")
   env.cacheDir = getEnv("CACHE_DIR")
   env.cheatDir = getEnv("CHEAT_DIR")
+  env.sdcardPath = getEnv("SDCARD_PATH")
 
   var missing: seq[string] = @[]
   if env.romDir == "":

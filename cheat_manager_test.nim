@@ -440,19 +440,21 @@ suite "isCheatZip":
       check isCheatZip(f) == false
 
 suite "findLocalCheatZip":
-  test "finds first valid zip":
+  test "finds first valid zip and extracts version":
     withTempDir(tmp):
       copyFile(FIXTURES / "cheats.zip", tmp / "cheats.zip")
-      check findLocalCheatZip(tmp) == tmp / "cheats.zip"
+      let (path, version) = findLocalCheatZip(tmp)
+      check path == tmp / "cheats.zip"
+      check version == "v1.0"
   test "ignores invalid zips":
     withTempDir(tmp):
       copyFile(FIXTURES / "not-a-cheat.zip", tmp / "other.zip")
-      check findLocalCheatZip(tmp) == ""
+      check findLocalCheatZip(tmp) == ("", "")
   test "empty directory":
     withTempDir(tmp):
-      check findLocalCheatZip(tmp) == ""
+      check findLocalCheatZip(tmp) == ("", "")
   test "empty path":
-    check findLocalCheatZip("") == ""
+    check findLocalCheatZip("") == ("", "")
 
 # ---------------------------------------------------------------------------
 
