@@ -2,3 +2,5 @@
 deps
 release
 workspace
+coverage
+nimcache
