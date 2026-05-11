@@ -1,0 +1,64 @@
+# Manual runs (workflow_dispatch) build and upload artifacts — no GitHub Release.
+# Pushing a tag matching v* runs the same pipeline, validates pak.json, then publishes a Release.
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate pak.json matches tag
+        if: github.ref_type == 'tag'
+        run: |
+          set -eux
+          TAG="${GITHUB_REF#refs/tags/}"
+          V="$(jq -r '.version' pak.json)"
+          test "$V" = "$TAG"
+          jq -e --arg t "$TAG" '.changelog[$t] != null and ((.changelog[$t] | type) == "string") and ((.changelog[$t] | length) > 0)' pak.json
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q jq zip wget unzip xz-utils
+
+      - name: Fetch dependencies and cross-toolchain binaries
+        run: sh build-deps.sh
+
+      - name: Add Nim to PATH
+        run: echo "PATH=${{ github.workspace }}/workspace/nim-2.2.8/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Run unit tests
+        run: make test
+
+      - name: Run e2e tests
+        run: make test-e2e
+
+      - name: Build release artifacts
+        run: sh build-release.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: |
+            release/CheatDownloaderOffline-*.pak.zip
+            release/CheatDownloaderOffline.pakz
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/CheatDownloaderOffline-*.pak.zip
+            release/CheatDownloaderOffline.pakz
