@@ -30,7 +30,7 @@ fi
 SOURCE=${SOURCE:-cheat_manager.nim}
 OUTPUT=$(basename "$SOURCE" .nim)
 
-NIM_FLAGS="--threads:off -d:minizDir=workspace/miniz-${MINIZ_VER} --passC:-Iworkspace/miniz-${MINIZ_VER} -p:nim-${NIM_VER}/pkgs/db_connector/src"
+NIM_FLAGS="--threads:off -d:minizDir=workspace/miniz-${MINIZ_VER} --passC:-Iworkspace/miniz-${MINIZ_VER} -p:workspace/nim-${NIM_VER}/pkgs/db_connector/src"
 if [ "$BUILD_TYPE" = "release" ]; then
   NIM_FLAGS="$NIM_FLAGS -d:release -d:strip --opt:size -d:lto --passC:-fno-strict-aliasing --passL:-fno-strict-aliasing --passL:-Wno-lto-type-mismatch"
 fi
