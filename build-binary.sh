@@ -30,7 +30,7 @@ fi
 SOURCE=${SOURCE:-cheat_manager.nim}
 OUTPUT=$(basename "$SOURCE" .nim)
 
-NIM_FLAGS="--threads:off -d:minizDir=workspace/miniz-${MINIZ_VER} --passC:-Iworkspace/miniz-${MINIZ_VER} -p:nim-${NIM_VER}/pkgs/db_connector/src"
+NIM_FLAGS="--threads:off -d:minizDir=workspace/miniz-${MINIZ_VER} --passC:-Iworkspace/miniz-${MINIZ_VER} -p:workspace/nim-${NIM_VER}/pkgs/db_connector/src"
 if [ "$BUILD_TYPE" = "release" ]; then
   NIM_FLAGS="$NIM_FLAGS -d:release -d:strip --opt:size -d:lto --passC:-fno-strict-aliasing --passL:-fno-strict-aliasing --passL:-Wno-lto-type-mismatch"
 fi
@@ -74,7 +74,7 @@ for platform in $TARGETS; do
 
     echo "nim-${NIM_VER}/bin/nim c --cpu:arm64 --os:linux --nimcache:$NIMCACHE --arm64.linux.gcc.exe:\${CROSS_ROOT}/bin/\${CROSS_COMPILE}gcc --arm64.linux.gcc.linkerexe:\${CROSS_ROOT}/bin/\${CROSS_COMPILE}gcc ${NIM_FLAGS} -o:$OUTPUT $SOURCE || exit" >> $BUILD_SCRIPT
 
-    docker run -it -v "$(pwd)/workspace/:/root/workspace" --rm "ghcr.io/loveretro/${platform}-toolchain" /bin/sh $BUILD_SCRIPT
+    docker run -v "$(pwd)/workspace/:/root/workspace" --rm "ghcr.io/loveretro/${platform}-toolchain" /bin/sh $BUILD_SCRIPT
 
     mkdir -p deps
     cp workspace/$OUTPUT workspace/${OUTPUT}-${platform}
