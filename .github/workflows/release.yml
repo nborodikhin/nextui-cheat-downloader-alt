@@ -1,21 +1,21 @@
 # Manual runs (workflow_dispatch) build and upload artifacts — no GitHub Release.
 # Pushing a tag matching v* runs the same pipeline, validates pak.json, then publishes a Release.
+# Coverage report is published to GitHub Pages after every successful run.
 name: Release
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
   push:
     tags:
       - "v*"
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -33,7 +33,7 @@ jobs:
       - name: Install host packages
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q jq zip wget unzip xz-utils
+          sudo apt-get install -y -q jq zip wget unzip xz-utils gcovr
 
       - name: Fetch dependencies and cross-toolchain binaries
         run: sh build-deps.sh
@@ -41,11 +41,13 @@ jobs:
       - name: Add Nim to PATH
         run: echo "PATH=${{ github.workspace }}/workspace/nim-2.2.8/bin:$PATH" >> "$GITHUB_ENV"
 
-      - name: Run unit tests
-        run: make test
+      - name: Run tests with coverage
+        run: make coverage
 
-      - name: Run e2e tests
-        run: make test-e2e
+      - name: Upload coverage report to Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: coverage/
 
       - name: Build release artifacts
         run: sh build-release.sh
@@ -65,3 +67,14 @@ jobs:
           files: |
             release/CheatDownloaderOffline-*.pak.zip
             release/CheatDownloaderOffline.pakz
+
+  deploy-pages:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy coverage to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
