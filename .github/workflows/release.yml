@@ -5,10 +5,9 @@ name: Release
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
   push:
+    branches:
+      - ci/github-actions-release
     tags:
       - "v*"
 
