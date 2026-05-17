@@ -2,6 +2,9 @@
 
 A MinUI pak for browsing, finding, and installing game cheat files from the Libretro database directly on your device.
 
+[![Latest Release](https://img.shields.io/github/v/release/nborodikhin/nextui-cheat-downloader-alt)](https://github.com/nborodikhin/nextui-cheat-downloader-alt/releases/latest)
+[![Test Coverage](https://img.shields.io/badge/coverage-report-blue)](https://nborodikhin.github.io/nextui-cheat-downloader-alt/)
+
 <img width="300" alt="Screenshots" src="/screenshots/screenshots.gif"/>
 
 ## Requirements
@@ -15,7 +18,7 @@ This pak is tested on the following NextUI devices:
 1. Simple
 
     - Mount your NextUI SD card.
-    - Download .pakz from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
+    - Download .pakz from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader-alt/releases).
     - Put it into the root of the SD card
     - Unmount SD card
     - Pak will be installed on the next NextUI boot
@@ -23,7 +26,7 @@ This pak is tested on the following NextUI devices:
 2. Manual (here for tg5040, replace with your device identifier is needed)
 
     - Mount your NextUI SD card.
-    - Download CheatDownloader.pak.tg5040.zip from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader_alt/releases).
+    - Download CheatDownloader.pak.tg5040.zip from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader-alt/releases).
     - Unpack it into `/Tools/tg5040/`
     - You should have files in the subfolder, e.g. `/Tools/tg5040/Cheat Downloader Offline/launch.sh`
     - Unmount SD card
