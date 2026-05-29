@@ -16,27 +16,14 @@ download() {
   fi
 }
 
-# Detect host OS and architecture to select the right Nim package
 OS=$(uname -s)
 ARCH=$(uname -m)
-if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
-  NIM_PLATFORM_SUFFIX="macosx_arm64"
-  NIM_PKG_EXT="tar.gz"
-elif [ "$OS" = "Darwin" ]; then
-  NIM_PLATFORM_SUFFIX="macosx_x64"
-  NIM_PKG_EXT="tar.gz"
-else
-  NIM_PLATFORM_SUFFIX="linux_x64"
-  NIM_PKG_EXT="tar.xz"
-fi
+
+mkdir -p deps workspace
 
 for PLATFORM in tg5040 tg5050 my355; do
-  mkdir -p deps
-  mkdir -p workspace
   MINUI_LIST_BIN=deps/minui-list-$PLATFORM
   MINUI_PRESENTER_BIN=deps/minui-presenter-$PLATFORM
-  NIMDIR=nim-$NIM_VER
-  NIMBIN=workspace/$NIMDIR/bin/nim
 
   MAKEFLAGS="-j8"
 
@@ -68,19 +55,31 @@ for PLATFORM in tg5040 tg5050 my355; do
 done
 
 
-# host
+# On macOS, download the host-native Nim to workspace/nim-${NIM_VER}-host/ for local builds.
+# Do this before extracting the Linux Nim: both archives unpack as nim-${NIM_VER}/, so we
+# extract and immediately rename to avoid a collision.
+if [ "$OS" = "Darwin" ]; then
+  if [ "$ARCH" = "arm64" ]; then
+    HOST_NIM_SUFFIX="macosx_arm64"
+  else
+    HOST_NIM_SUFFIX="macosx_x64"
+  fi
+  HOST_NIMBIN=workspace/nim-${NIM_VER}-host/bin/nim
+  if [ ! -f $HOST_NIMBIN ]; then
+    host_nimdlflag=workspace/nim-host.downloaded
+    host_nimpkg=nim-${NIM_VER}-${HOST_NIM_SUFFIX}.tar.gz
+    [ ! -f $host_nimdlflag ] && ( download https://nim-lang.org/download/$host_nimpkg workspace/$host_nimpkg && touch $host_nimdlflag )
+    [ ! -f $HOST_NIMBIN ] && ( cd workspace && tar -xzf $host_nimpkg && mv nim-${NIM_VER} nim-${NIM_VER}-host )
+  fi
+fi
+
+# Always download the Linux x64 Nim — used inside Docker cross-compilation containers.
+NIMBIN=workspace/nim-${NIM_VER}/bin/nim
 if [ ! -f $NIMBIN ]; then
   nimdlflag=workspace/nim.downloaded
-  nimpkg=nim-${NIM_VER}-${NIM_PLATFORM_SUFFIX}.${NIM_PKG_EXT}
-
+  nimpkg=nim-${NIM_VER}-linux_x64.tar.xz
   [ ! -f $nimdlflag ] && ( download https://nim-lang.org/download/$nimpkg workspace/$nimpkg && touch $nimdlflag )
-  if [ ! -f $NIMBIN ]; then
-    if [ "$NIM_PKG_EXT" = "tar.xz" ]; then
-      ( cd workspace && tar -xJf $nimpkg )
-    else
-      ( cd workspace && tar -xzf $nimpkg )
-    fi
-  fi
+  [ ! -f $NIMBIN ] && ( cd workspace && tar -xJf $nimpkg )
 fi
 
 if [ ! -f workspace/workspace ]; then
