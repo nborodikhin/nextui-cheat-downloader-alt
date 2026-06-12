@@ -36,6 +36,12 @@ if [ "$BUILD_TYPE" = "release" ]; then
 fi
 NIM_FLAGS="$NIM_FLAGS ${EXTRA_NIM_FLAGS:-}"
 
+# Use the host-native Nim on macOS; fall back to the Linux x64 one on Linux.
+HOST_NIM="workspace/nim-${NIM_VER}/bin/nim"
+if [ "$(uname -s)" = "Darwin" ] && [ -f "workspace/nim-${NIM_VER}-host/bin/nim" ]; then
+  HOST_NIM="workspace/nim-${NIM_VER}-host/bin/nim"
+fi
+
 echorun () {
   echo "$@"
   "$@"
@@ -61,7 +67,7 @@ for platform in $TARGETS; do
   echo "Building $platform $BUILD_TYPE"
 
   if [ "$platform" = "host" ]; then
-    echorun nim c $NIM_FLAGS --nimcache:nimcache -o:$OUTPUT $SOURCE
+    echorun $HOST_NIM c $NIM_FLAGS --nimcache:nimcache -o:$OUTPUT $SOURCE
   else
     BUILD_SCRIPT=workspace/buildbin.sh
     NIMCACHE=nimcache
