@@ -5,3 +5,9 @@ release
 workspace
 coverage
 nimcache
+__pycache__/
+
+# Host binaries produced by ./dev build and ./dev test
+cheat_manager
+cheat_manager_test
+cheat_manager_e2e

@@ -61,6 +61,77 @@ This pak is tested on the following NextUI devices:
 - The cheat database is cached at `/mnt/SDCARD/.userdata/Cheat Downloader Offline/` as a local SQLite index, so searching is fast and works entirely offline after the initial download.
 - Folder-to-system mappings and your last-used game per system are remembered across sessions.
 
+## Building from Source
+
+`./dev` is the single entry point for development: it fetches prerequisites,
+builds, tests, packages, and manages versions. It needs Python 3 and, for
+device builds, Docker (or Podman via `--podman`).
+
+```bash
+# One-time (and after a dependency version bump): download the Nim compiler,
+# the miniz sources, and the minui-list/minui-presenter helper binaries
+./dev setup
+
+# Build
+./dev build                            # host build, for local testing
+./dev build tg5040 tg5050              # cross-compile for devices
+./dev build all --release              # every platform, optimised and stripped
+
+# Test
+./dev test                             # unit tests
+./dev test --e2e                       # unit + end-to-end tests
+./dev test --coverage                  # both suites, writes coverage/index.html
+
+# Deploy to a device over ADB
+./dev devices                          # what is connected, and what it is
+./dev install device                   # push the binary to every device
+./dev install brick --full             # push the complete pak
+./dev run device                       # install and launch on the device
+./dev run device --delete              # replace the installed pak, then launch
+
+# Run the app locally against a sandbox SD card layout in /tmp
+./dev run
+./dev run --reset                      # start from an empty sandbox
+./dev run -- textui jsonui             # pass arguments to the app
+
+# Package the release artifacts into release/
+./dev dist --strict
+
+# Remove generated files (add --deps to also drop workspace/ and deps/)
+./dev clean
+
+# Inspect or edit the version and changelog in pak.json
+./dev version latest
+./dev version create 1.7.0 "What changed"
+
+# Enter a toolchain, or run one command in it
+./dev docker tg5040
+./dev docker tg5040 -- ls
+```
+
+Platform aliases include `brick`, `brickpro`, `tsp`, `smartpro`, `5040`,
+`tsps`, `smartpros`, `5050`, `flip`, and `355`. Aliases ignore case, spaces,
+hyphens, and underscores. `all` expands to every platform, and `host` (also
+`native`, `local`) means this machine.
+
+`install` and `run` additionally accept `device`, meaning every connected
+device, or a raw ADB serial. By default they push only the app binary, which
+is the quick path while iterating; `--full` installs the complete pak and
+`--delete` removes the installed pak first, clearing files left over from an
+older version (userdata is kept).
+
+`run` on a device restarts the app in place when it is already running:
+`launch.sh` re-runs the app if `/tmp/nextui-cheat-downloader.restart` exists
+when it exits, so a rebuilt binary can be swapped in without returning to the
+menu. Otherwise the app is launched through NextUI. A pak installed before
+that hook existed needs one `./dev install <target> --full` to pick it up.
+
+`./dev dist` produces `release/CheatDownloaderOffline-<platform>.pak.zip` for
+manual installs and the combined `release/CheatDownloaderOffline.pakz` used by
+the SD card auto-installer. `--strict` requires every platform to build and
+verifies that each staged pak contains exactly the expected files — the release
+workflow uses it.
+
 ## Acknowledgements
 
 - [Cheat Downloader.pak](https://github.com/mikecosentino/nextui-cheat-downloader) by Mike Cosentino
