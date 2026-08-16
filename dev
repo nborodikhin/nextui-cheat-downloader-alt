@@ -10,7 +10,10 @@ releases, and editing the version/changelog in pak.json.
     ./dev build all        # cross-build every device platform
     ./dev test             # unit tests
     ./dev test --e2e       # unit + end-to-end tests
-    ./dev run              # build and run the app against a sandbox SD card
+    ./dev devices          # list connected ADB devices and their platforms
+    ./dev install device   # build and install onto every connected device
+    ./dev run              # build and run against a sandbox SD card
+    ./dev run device       # build, install, and launch on a connected device
     ./dev dist --strict    # build and package the release artifacts
     ./dev clean            # remove generated files
     ./dev version latest   # inspect or edit pak.json versions
@@ -31,6 +34,10 @@ is what the test suites exercise. Device builds run the same Nim compiler
 inside the platform's toolchain container, which mounts workspace/ as its
 working directory - that is why the sources are copied into workspace/ and
 why every compiler path below is written relative to workspace/.
+
+Devices are reached over ADB. `devices` reports what is connected and which
+platform each one is, and any command that takes a target accepts `device`
+(every connected device), a platform name, or an ADB serial.
 """
 
 import argparse
@@ -42,7 +49,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -84,6 +93,9 @@ COVERAGE_DIR = ROOT / "coverage"
 APP_SOURCE = "cheat_manager.nim"
 UNIT_TEST_SOURCE = "cheat_manager_test.nim"
 E2E_TEST_SOURCE = "cheat_manager_e2e.nim"
+# Nim names a binary after its source, so this is both the host binary in the
+# repository root and the name inside the pak.
+APP_BINARY = Path(APP_SOURCE).stem
 
 # Packaging names. NextUI installs a pak by extracting <name>.pak.zip into
 # /Tools/<platform>/, and the combined .pakz is what the SD card auto-installer
@@ -100,6 +112,24 @@ PAK_HELPERS = ("minui-list", "minui-presenter")
 
 PAK_FILE = ROOT / "pak.json"
 TOOLCHAIN_IMAGE = "ghcr.io/loveretro/{platform}-toolchain"
+
+# On-device layout. NextUI keeps tool paks under /mnt/SDCARD/Tools/<platform>/
+# and launches the one the user picks by writing its launch.sh into /tmp/next
+# and restarting itself.
+REMOTE_ROOT = "/mnt/SDCARD/Tools"
+REMOTE_BIN_SUBDIR = "bin/arm"
+NEXTUI_PROCESS = "nextui.elf"
+
+# /proc/cpuinfo markers used to tell connected devices apart. Several TrimUI
+# board revisions share the tg5040 build; the Miyoo Flip reports only its CPU
+# part number, which is what 0xd05 is.
+CPUINFO_PLATFORMS = {
+    "TG5040": "tg5040",
+    "TG3040": "tg5040",
+    "TG4040": "tg5040",
+    "TG5050": "tg5050",
+    "0xd05": "my355",
+}
 
 # Compiler paths, written relative to the directory the compiler runs from.
 # On the host that directory is the repository root; inside a toolchain
@@ -131,6 +161,16 @@ SAMPLE_ROMS = (
     "Sony PlayStation (PS)/Metal Gear Solid/Metal Gear Solid.m3u",
 )
 DEFAULT_TEST_ROOT = Path("/tmp/CheatDownloaderOffline")
+
+
+@dataclass(frozen=True)
+class Device:
+    """One entry from `adb devices`, with its platform once detected."""
+
+    serial: str
+    state: str
+    platform: str = "unknown"
+    hardware: str = "-"
 
 
 class DevError(Exception):
@@ -305,6 +345,218 @@ def resolve_targets(values, default, allow_host=True, all_expands_to=ALL_TARGETS
             raise DevError("host is not a valid target for this command")
         targets.append(platform)
     return unique(targets)
+
+
+# ---------------------------------------------------------------------------
+# ADB - talking to connected devices
+# ---------------------------------------------------------------------------
+
+
+def adb(device, *args, check=True):
+    """Run an ADB command and return stdout as a list of lines.
+
+    ADB emits CRLF on some hosts, so carriage returns are dropped before the
+    output is split.
+    """
+    command = ["adb"]
+    if device is not None:
+        command.extend(["-s", device.serial])
+    command.extend(str(argument) for argument in args)
+    result = run_command(command, capture=True, check=check)
+    return result.stdout.decode(errors="replace").replace("\r", "").splitlines()
+
+
+def adb_shell(device, *args, check=True):
+    """Run one device-side command, quoting it so paths with spaces survive."""
+    return adb(device, "shell", shlex.join(str(a) for a in args), check=check)
+
+
+def list_devices(detect_platforms=True):
+    """Enumerate ADB devices, identifying the platform of each ready one."""
+    if not shutil.which("adb"):
+        raise DevError("adb is not installed or not on PATH")
+
+    devices = []
+    for line in adb(None, "devices")[1:]:  # first line is a header
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        device = Device(serial=fields[0], state=fields[1])
+        if device.state == "device" and detect_platforms:
+            device = detect_device(device)
+        devices.append(device)
+    return devices
+
+
+def detect_device(device):
+    """Identify a device's platform from /proc/cpuinfo."""
+    cpuinfo = "\n".join(adb_shell(device, "cat", "/proc/cpuinfo", check=False))
+    for identifier, platform in CPUINFO_PLATFORMS.items():
+        if identifier in cpuinfo:
+            return Device(
+                serial=device.serial,
+                state=device.state,
+                platform=platform,
+                hardware=identifier,
+            )
+    return device
+
+
+def resolve_device_targets(values, devices, allow_host):
+    """Expand target names into build platforms and concrete devices.
+
+    Accepts the same names as the build commands plus `device` (every
+    connected device) and raw ADB serials. Returns the platforms that need
+    building and the devices to deploy to - `host` contributes a build
+    platform but no device.
+    """
+    ready = [device for device in devices if device.state == "device"]
+    by_serial = {device.serial: device for device in devices}
+    build_platforms = []
+    targets = []
+
+    for value in values:
+        key = normalize_alias(value)
+
+        if key == "device":
+            selected = [d for d in ready if d.platform in DEVICE_PLATFORMS]
+            if not selected:
+                raise DevError("No supported ADB devices are connected")
+            targets.extend(selected)
+            build_platforms.extend(device.platform for device in selected)
+            continue
+
+        platform = platform_for_alias(key)
+        if platform == "host":
+            if not allow_host:
+                raise DevError("host is not a valid target for this command")
+            build_platforms.append(platform)
+            continue
+        if platform:
+            selected = [device for device in ready if device.platform == platform]
+            if not selected:
+                raise DevError("No connected device matches " + platform)
+            targets.extend(selected)
+            build_platforms.append(platform)
+            continue
+
+        # Anything left is treated as an ADB serial.
+        device = by_serial.get(value)
+        if not device:
+            raise DevError("Unknown target, alias, or ADB serial: " + value)
+        if device.state != "device":
+            raise DevError("ADB device {} is {}".format(value, device.state))
+        if device.platform not in DEVICE_PLATFORMS:
+            raise DevError("Could not detect the platform of ADB device " + value)
+        targets.append(device)
+        build_platforms.append(device.platform)
+
+    # One entry per device even if it was named several ways.
+    targets = list({device.serial: device for device in targets}.values())
+    return unique(build_platforms), targets
+
+
+def remote_pak_path(platform):
+    return "{}/{}/{}".format(REMOTE_ROOT, platform, PAK_DIR_NAME)
+
+
+def get_pids(device, process):
+    """Return the PIDs of a running process, or an empty list."""
+    pids = " ".join(adb_shell(device, "pidof", process, check=False)).split()
+    return [pid for pid in pids if pid.isdigit()]
+
+
+def stop_app(device):
+    """Kill the app if it is running, so a new binary is picked up."""
+    pids = get_pids(device, APP_BINARY)
+    if not pids:
+        return False
+    adb_shell(device, "kill", "-KILL", *pids)
+    return True
+
+
+def wait_for_nextui(device, timeout=8.0):
+    """Wait for NextUI to come back to the foreground after the app exits."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pids = get_pids(device, NEXTUI_PROCESS)
+        if pids:
+            return pids
+        time.sleep(0.25)
+    return []
+
+
+def launch_from_nextui(device):
+    """Launch the pak the way the menu does: queue it, then restart NextUI.
+
+    NextUI reads /tmp/next on exit and runs whatever command it finds there,
+    so writing the pak's launch.sh and killing NextUI starts the app with the
+    same environment a normal launch would give it.
+    """
+    pids = wait_for_nextui(device)
+    if not pids:
+        raise DevError(
+            "{} is not running on {}. Launch the pak from the menu instead.".format(
+                NEXTUI_PROCESS, device.serial
+            )
+        )
+
+    launch_command = "'{}/launch.sh'".format(remote_pak_path(device.platform))
+    with tempfile.TemporaryDirectory(prefix="cheat-downloader-next-") as staging:
+        next_file = Path(staging) / "next"
+        next_file.write_bytes(launch_command.encode("utf-8"))
+        adb(device, "push", str(next_file), "/tmp/next")
+    adb_shell(device, "kill", "-KILL", *pids)
+
+
+def install_binary(device):
+    """Push just the app binary - the fast path while iterating on code."""
+    source = WORKSPACE / "{}-{}".format(APP_BINARY, device.platform)
+    if not source.exists():
+        raise DevError(
+            "{} is missing. Build for {} first.".format(
+                relative(source), device.platform
+            )
+        )
+    destination = "{}/{}".format(remote_pak_path(device.platform), REMOTE_BIN_SUBDIR)
+    adb_shell(device, "mkdir", "-p", destination)
+    adb(device, "push", str(source), "{}/{}".format(destination, APP_BINARY))
+    print("  {} <- {}".format(device.serial, relative(source)))
+
+
+def install_full(device, package, delete):
+    """Push the whole staged pak directory.
+
+    With delete the installed pak is removed first, which clears files left
+    over from older versions. Userdata lives elsewhere and is untouched.
+    """
+    if delete:
+        stop_app(device)
+        adb_shell(device, "rm", "-rf", remote_pak_path(device.platform))
+    remote_dir = "{}/{}".format(REMOTE_ROOT, device.platform)
+    adb_shell(device, "mkdir", "-p", remote_dir)
+    adb(device, "push", str(package), remote_dir + "/")
+    print("  {} <- {}".format(device.serial, relative(package)))
+
+
+def run_on_device(device):
+    """Stop the app if it is running, then launch the freshly installed one."""
+    stop_app(device)
+    launch_from_nextui(device)
+
+
+def command_devices(_args):
+    devices = list_devices()
+    if not devices:
+        print("No ADB devices found.")
+        return 0
+
+    row = "{:<24} {:<14} {:<10} {}"
+    print(row.format("SERIAL", "STATE", "PLATFORM", "HARDWARE"))
+    for device in devices:
+        state = "connected" if device.state == "device" else device.state
+        print(row.format(device.serial, state, device.platform, device.hardware))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -537,27 +789,47 @@ def build_device(platform, runtime, source=APP_SOURCE, release=False):
     flags = " ".join(shlex.quote(flag) for flag in nim_flags(release))
     script = "\n".join(
         [
+            "#!/bin/sh",
+            "# Generated by ./dev - re-run inside the {platform} toolchain with:",
+            "#   ./dev docker {platform} -- /bin/sh {script_name}",
             "set -e",
+            "",
             # The cache holds C output for one platform at a time. A marker
             # file records which one, so switching platforms starts clean
             # instead of linking objects from the previous architecture.
             "if [ ! -f {cache}/{platform} ]; then rm -rf {cache}; fi",
             "mkdir -p {cache}",
             "touch {cache}/{platform}",
-            "nim-{version}/bin/nim c --cpu:arm64 --os:linux --nimcache:{cache}"
-            " --arm64.linux.gcc.exe:${{CROSS_ROOT}}/bin/${{CROSS_COMPILE}}gcc"
-            " --arm64.linux.gcc.linkerexe:${{CROSS_ROOT}}/bin/${{CROSS_COMPILE}}gcc"
-            " {flags} -o:{output} {source}",
+            "",
+            "nim-{version}/bin/nim c --cpu:arm64 --os:linux --nimcache:{cache} \\",
+            "  --arm64.linux.gcc.exe:${{CROSS_ROOT}}/bin/${{CROSS_COMPILE}}gcc \\",
+            "  --arm64.linux.gcc.linkerexe:${{CROSS_ROOT}}/bin/${{CROSS_COMPILE}}gcc \\",
+            "  {flags} \\",
+            "  -o:{output} {source}",
+            "",
         ]
-    ).format(
-        cache=cache,
-        platform=platform,
-        version=NIM_VER,
-        flags=flags,
-        output=shlex.quote(output),
-        source=shlex.quote(source),
     )
-    run_container(runtime, platform, ["/bin/sh", "-c", script])
+
+    # The build script is written into workspace/ and kept there rather than
+    # being passed inline, so a failing build can be inspected and re-run by
+    # hand inside the container.
+    script_name = "build-{}-{}.sh".format(output, platform)
+    script_path = WORKSPACE / script_name
+    script_path.write_text(
+        script.format(
+            cache=cache,
+            platform=platform,
+            version=NIM_VER,
+            flags=flags,
+            output=shlex.quote(output),
+            source=shlex.quote(source),
+            script_name=script_name,
+        )
+    )
+    script_path.chmod(0o755)
+
+    print("  script {}".format(relative(script_path)), flush=True)
+    run_container(runtime, platform, ["/bin/sh", script_name])
 
     # Keep one binary per platform so `dist` can package them all in one pass.
     produced = WORKSPACE / output
@@ -664,12 +936,12 @@ def write_coverage_report(open_report=False):
 
 
 # ---------------------------------------------------------------------------
-# run - exercise the app against a sandbox SD card
+# install and run - deploy to devices, or run locally against a sandbox
 # ---------------------------------------------------------------------------
 
 
-def command_run(args):
-    """Build the host binary and run it against a throwaway SD card layout.
+def run_host_sandbox(args):
+    """Run the host binary against a throwaway SD card layout.
 
     The app reads its ROM, cheat, and cache directories from the environment
     (launch.sh sets them from NextUI's own variables on device), so pointing
@@ -680,14 +952,11 @@ def command_run(args):
         print("Removing " + str(test_root))
         shutil.rmtree(test_root)
 
-    app = ROOT / Path(APP_SOURCE).stem
-    if args.no_build:
-        if not app.exists():
-            raise DevError(
-                "{} has not been built. Run './dev build' first.".format(relative(app))
-            )
-    else:
-        build_host(APP_SOURCE)
+    app = ROOT / APP_BINARY
+    if not app.exists():
+        raise DevError(
+            "{} has not been built. Run './dev build' first.".format(relative(app))
+        )
 
     rom_dir = test_root / "Roms"
     cheat_dir = test_root / "Cheats"
@@ -708,14 +977,82 @@ def command_run(args):
 
     # Default to the terminal UI, which needs no device hardware. Anything
     # after `--` replaces those arguments.
-    app_args = args.app_args
-    if app_args[:1] == ["--"]:
-        app_args = app_args[1:]
-    if not app_args:
-        app_args = ["textui", "debug"]
+    app_args = args.app_args or ["textui", "debug"]
 
     print("Sandbox: " + str(test_root))
     return run_command(["./" + app.name, *app_args], env=env, check=False).returncode
+
+
+def install_or_run(args, should_run):
+    """Shared body of `install` and `run`.
+
+    Both build what the targets need, deploy to every named device, and
+    optionally launch. `host` is only meaningful for run, where it means the
+    local sandbox rather than a device.
+    """
+    targets = args.targets
+    if not targets:
+        if not should_run:
+            raise DevError("install requires at least one target")
+        targets = ["host"]
+
+    # --delete only makes sense for a full install, so it implies one.
+    full = args.full or args.delete
+
+    # Skip the ADB round-trip entirely when nothing but the sandbox is asked
+    # for - a local run should not require adb to be installed.
+    only_host = all(platform_for_alias(target) == "host" for target in targets)
+    devices = [] if only_host else list_devices()
+    platforms, device_targets = resolve_device_targets(
+        targets, devices, allow_host=should_run
+    )
+
+    if not args.no_build:
+        build_targets(platforms, container_runtime(args))
+
+    # Group by platform so a full install stages each pak only once, however
+    # many devices of that platform are connected.
+    by_platform = {}
+    for device in device_targets:
+        by_platform.setdefault(device.platform, []).append(device)
+
+    failures = []
+    for platform, matching in by_platform.items():
+        package = None
+        if full:
+            try:
+                _tools_dir, package = stage_pak(platform, strict=False)
+            except DevError as error:
+                failures.append(str(error))
+                continue
+
+        for device in matching:
+            # One device failing should not strand the others.
+            try:
+                if package:
+                    install_full(device, package, delete=args.delete)
+                else:
+                    install_binary(device)
+                if should_run:
+                    run_on_device(device)
+            except DevError as error:
+                failures.append(str(error))
+
+    status = 0
+    if should_run and "host" in platforms:
+        status = run_host_sandbox(args)
+
+    if failures:
+        raise DevError("\n".join(failures))
+    return status
+
+
+def command_install(args):
+    return install_or_run(args, should_run=args.run)
+
+
+def command_run(args):
+    return install_or_run(args, should_run=True)
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +1071,11 @@ def stage_pak(platform, strict):
     """
     tools_dir = RELEASE_DIR / "Tools" / platform
     pak_dir = tools_dir / PAK_DIR_NAME
-    bin_dir = pak_dir / "bin" / "arm"
+    # Start from an empty pak so a re-run cannot inherit files from an older
+    # layout - `install --full` pushes whatever is staged here.
+    if pak_dir.exists():
+        shutil.rmtree(pak_dir)
+    bin_dir = pak_dir / REMOTE_BIN_SUBDIR
     bin_dir.mkdir(parents=True, exist_ok=True)
 
     missing = []
@@ -745,8 +1086,7 @@ def stage_pak(platform, strict):
     # Helper binaries come from `./dev setup`, the app binary from the
     # cross-build above.
     sources = {name: DEPS / "{}-{}".format(name, platform) for name in PAK_HELPERS}
-    app_name = Path(APP_SOURCE).stem
-    sources[app_name] = WORKSPACE / "{}-{}".format(app_name, platform)
+    sources[APP_BINARY] = WORKSPACE / "{}-{}".format(APP_BINARY, platform)
 
     for name, source in sources.items():
         if not source.exists() or not source.stat().st_size:
@@ -770,7 +1110,7 @@ def stage_pak(platform, strict):
         # Verify the staged tree is exactly what is expected - no leftovers
         # from an earlier run with a different layout, nothing empty.
         expected = {Path(name) for name in PAK_FILES}
-        expected.update(Path("bin/arm") / name for name in sources)
+        expected.update(Path(REMOTE_BIN_SUBDIR) / name for name in sources)
         actual = {
             path.relative_to(pak_dir) for path in pak_dir.rglob("*") if path.is_file()
         }
@@ -881,9 +1221,12 @@ def remove_build_output(include_release=True):
 
     if not WORKSPACE.exists():
         return
-    # Nim sources copied in for container builds, and the cross-built binaries
-    # staged beside them. The compilers and miniz sources are left alone.
+    # Nim sources copied in for container builds, the generated build scripts,
+    # and the cross-built binaries staged beside them. The compilers and miniz
+    # sources are left alone.
     for path in WORKSPACE.glob("*.nim"):
+        remove_path(path)
+    for path in WORKSPACE.glob("build-*.sh"):
         remove_path(path)
     for name in binaries:
         for path in WORKSPACE.glob(name + "*"):
@@ -1027,12 +1370,33 @@ def command_docker(args):
 # ---------------------------------------------------------------------------
 
 
-def add_podman_option(parser):
+def add_podman_option(parser, help_text="use Podman instead of Docker"):
+    parser.add_argument("--podman", action="store_true", help=help_text)
+
+
+def add_deploy_options(parser, include_run, target_help):
+    """Options shared by install and run."""
+    parser.add_argument("targets", nargs="*", metavar="target", help=target_help)
+    add_podman_option(parser)
     parser.add_argument(
-        "--podman",
+        "--full",
         action="store_true",
-        help="use Podman instead of Docker",
+        help="install the complete pak (default: only the app binary)",
     )
+    parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="remove the installed pak before pushing it (implies --full)",
+    )
+    parser.add_argument(
+        "--no-build",
+        action="store_true",
+        help="deploy the existing binaries instead of rebuilding",
+    )
+    if include_run:
+        parser.add_argument(
+            "--run", action="store_true", help="launch the app after installing"
+        )
 
 
 def create_parser():
@@ -1064,7 +1428,11 @@ def create_parser():
         action="store_true",
         help="re-download and re-unpack even if a prerequisite is present",
     )
-    add_podman_option(setup)
+    add_podman_option(
+        setup,
+        "use Podman instead of Docker to strip the helper binaries"
+        " (device targets only)",
+    )
     setup.set_defaults(handler=command_setup)
 
     build = subparsers.add_parser(
@@ -1105,35 +1473,68 @@ def create_parser():
     )
     test.set_defaults(handler=command_test)
 
+    devices = subparsers.add_parser(
+        "devices",
+        help="list connected ADB devices and their platforms",
+        description="list connected ADB devices and their platforms",
+        usage="%(prog)s [-h]",
+    )
+    devices.set_defaults(handler=command_devices)
+
+    install = subparsers.add_parser(
+        "install",
+        help="build and install onto connected devices",
+        description="build and install onto connected devices",
+        usage="%(prog)s target [-h] [--podman] [--full] [--delete] [--no-build] [--run]",
+    )
+    add_deploy_options(
+        install,
+        include_run=True,
+        target_help=(
+            "one or more of device, tg5040, tg5050, my355, or an ADB serial; "
+            "no default"
+        ),
+    )
+    # Only reachable via `install --run host`, but the sandbox runner reads
+    # these, so give them the same defaults the run parser sets.
+    install.set_defaults(
+        handler=command_install,
+        root=str(DEFAULT_TEST_ROOT),
+        reset=False,
+        app_args=[],
+    )
+
     run = subparsers.add_parser(
         "run",
-        help="build and run the app against a sandbox SD card",
-        description="build and run the app against a sandbox SD card",
-        usage="%(prog)s [-h] [--root dir] [--reset] [--no-build] [-- args ...]",
+        help="build and run, on a device or against a sandbox SD card",
+        description="build and run, on a device or against a sandbox SD card",
+        usage=(
+            "%(prog)s [target ...] [-h] [--podman] [--full] [--delete]"
+            " [--no-build] [--root dir] [--reset] [-- args ...]"
+        ),
+    )
+    add_deploy_options(
+        run,
+        include_run=False,
+        target_help=(
+            "one or more of host (default), device, tg5040, tg5050, my355, "
+            "or an ADB serial"
+        ),
     )
     run.add_argument(
         "--root",
         default=str(DEFAULT_TEST_ROOT),
         metavar="dir",
-        help="sandbox directory (default: {})".format(DEFAULT_TEST_ROOT),
+        help="host only: sandbox directory (default: {})".format(DEFAULT_TEST_ROOT),
     )
     run.add_argument(
         "--reset",
         action="store_true",
-        help="delete the sandbox before running, discarding cached state",
+        help="host only: delete the sandbox first, discarding cached state",
     )
-    run.add_argument(
-        "--no-build",
-        action="store_true",
-        help="run the existing binary instead of rebuilding it",
-    )
-    run.add_argument(
-        "app_args",
-        nargs=argparse.REMAINDER,
-        metavar="args",
-        help="arguments for the app (default: textui debug)",
-    )
-    run.set_defaults(handler=command_run)
+    # Anything after `--` is passed to the app itself (host runs only); it is
+    # split off before argparse sees it, so only the default lives here.
+    run.set_defaults(handler=command_run, app_args=[])
 
     dist = subparsers.add_parser(
         "dist",
@@ -1283,12 +1684,28 @@ def normalize_trailing_options(argv):
     return argv
 
 
+def split_app_args(argv):
+    """Split `./dev run ... -- app args` into our arguments and the app's.
+
+    argparse cannot do this itself: a REMAINDER positional after a variable
+    number of targets swallows the `--` instead of stopping at it.
+    """
+    argv = list(argv)
+    if argv[:1] != ["run"] or "--" not in argv:
+        return argv, []
+    separator = argv.index("--")
+    return argv[:separator], argv[separator + 1 :]
+
+
 def main():
     parser = create_parser()
-    args = parser.parse_args(normalize_trailing_options(sys.argv[1:]))
+    argv, app_args = split_app_args(normalize_trailing_options(sys.argv[1:]))
+    args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
         return 0
+    if app_args:
+        args.app_args = app_args
     try:
         return args.handler(args)
     except DevError as error:

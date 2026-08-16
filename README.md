@@ -82,9 +82,17 @@ device builds, Docker (or Podman via `--podman`).
 ./dev test --e2e                       # unit + end-to-end tests
 ./dev test --coverage                  # both suites, writes coverage/index.html
 
+# Deploy to a device over ADB
+./dev devices                          # what is connected, and what it is
+./dev install device                   # push the binary to every device
+./dev install brick --full             # push the complete pak
+./dev run device                       # install and launch on the device
+./dev run device --delete              # replace the installed pak, then launch
+
 # Run the app locally against a sandbox SD card layout in /tmp
 ./dev run
 ./dev run --reset                      # start from an empty sandbox
+./dev run -- textui jsonui             # pass arguments to the app
 
 # Package the release artifacts into release/
 ./dev dist --strict
@@ -105,6 +113,13 @@ Platform aliases include `brick`, `brickpro`, `tsp`, `smartpro`, `5040`,
 `tsps`, `smartpros`, `5050`, `flip`, and `355`. Aliases ignore case, spaces,
 hyphens, and underscores. `all` expands to every platform, and `host` (also
 `native`, `local`) means this machine.
+
+`install` and `run` additionally accept `device`, meaning every connected
+device, or a raw ADB serial. By default they push only the app binary, which
+is the quick path while iterating; `--full` installs the complete pak and
+`--delete` removes the installed pak first, clearing files left over from an
+older version (userdata is kept). `run` on a device stops the app if it is
+running and relaunches it through NextUI.
 
 `./dev dist` produces `release/CheatDownloaderOffline-<platform>.pak.zip` for
 manual installs and the combined `release/CheatDownloaderOffline.pakz` used by
