@@ -1,8 +1,7 @@
 #!/bin/sh
 
-MINUI_LIST_VER=0.14.0
-MINUI_PRESENTER_VER=0.12.0
 MINIZ_VER=3.1.1
+APOSTROPHE_VER=1.1.1
 NIM_VER=2.2.8
 
 # Use wget if available, otherwise fall back to curl (macOS ships curl, not wget)
@@ -19,41 +18,29 @@ download() {
 OS=$(uname -s)
 ARCH=$(uname -m)
 
-mkdir -p deps workspace
+mkdir -p workspace
 
-for PLATFORM in tg5040 tg5050 my355; do
-  MINUI_LIST_BIN=deps/minui-list-$PLATFORM
-  MINUI_PRESENTER_BIN=deps/minui-presenter-$PLATFORM
+minizdir=miniz-${MINIZ_VER}
+if [ ! -f $minizdir ]; then
+  minizdlflag=workspace/miniz.downloaded
+  [ ! -f minizdlflag ] && ( download https://github.com/richgel999/miniz/releases/download/${MINIZ_VER}/miniz-${MINIZ_VER}.zip workspace/miniz-${MINIZ_VER}.zip && touch $minizdlflag )
+  [ ! -d workspace/$minizdir ] && ( cd workspace; mkdir $minizdir; cd $minizdir; unzip ../miniz-${MINIZ_VER}.zip )
+fi
 
-  MAKEFLAGS="-j8"
-
-  minizdir=miniz-${MINIZ_VER}
-  if [ ! -f $minizdir ]; then
-    minizdlflag=workspace/miniz.downloaded
-    [ ! -f minizdlflag ] && ( download https://github.com/richgel999/miniz/releases/download/${MINIZ_VER}/miniz-${MINIZ_VER}.zip workspace/miniz-${MINIZ_VER}.zip && touch $minizdlflag )
-    [ ! -d workspace/$minizdir ] && ( cd workspace; mkdir $minizdir; cd $minizdir; unzip ../miniz-${MINIZ_VER}.zip )
-  fi
-
-  if [ ! -s $MINUI_LIST_BIN ]; then
-    download https://github.com/josegonzalez/minui-list/releases/download/$MINUI_LIST_VER/minui-list-$PLATFORM workspace/minui-list-$PLATFORM
-
-    echo "\${CROSS_ROOT}/bin/\${CROSS_COMPILE}strip minui-list-$PLATFORM" > workspace/buildminuilist.sh
-    docker run -v `pwd`/workspace/:/root/workspace --rm ghcr.io/loveretro/${PLATFORM}-toolchain /bin/sh buildminuilist.sh
-
-    cp workspace/minui-list-$PLATFORM $MINUI_LIST_BIN
-  fi
-
-  if [ ! -s $MINUI_PRESENTER_BIN ]; then
-    download https://github.com/josegonzalez/minui-presenter/releases/download/$MINUI_PRESENTER_VER/minui-presenter-$PLATFORM workspace/minui-presenter-$PLATFORM
-
-    echo "\${CROSS_ROOT}/bin/\${CROSS_COMPILE}strip minui-presenter-$PLATFORM" > workspace/buildminuipresenter.sh
-    docker run -v `pwd`/workspace/:/root/workspace --rm ghcr.io/loveretro/${PLATFORM}-toolchain /bin/sh buildminuipresenter.sh
-
-    cp workspace/minui-presenter-$PLATFORM $MINUI_PRESENTER_BIN
-  fi
-
-done
-
+# Apostrophe (https://github.com/Helaas/Apostrophe) — a header-only C UI
+# toolkit, compiled directly into cheat_manager via Nim FFI (see
+# apostrophe.nim). Vendored from its GitHub release source archive, same as
+# miniz/Nim above. Requires SDL2, SDL2_ttf and SDL2_image headers/libs to be
+# available to whatever compiler builds cheat_manager (already true inside
+# the tg5040/tg5050/my355 toolchain containers used below; for host builds
+# install them yourself, e.g. `apt install libsdl2-dev libsdl2-ttf-dev
+# libsdl2-image-dev` or `brew install sdl2 sdl2_ttf sdl2_image`).
+apostrophedir=apostrophe-${APOSTROPHE_VER}
+if [ ! -d workspace/$apostrophedir ]; then
+  apostrophedlflag=workspace/apostrophe.downloaded
+  [ ! -f $apostrophedlflag ] && ( download https://github.com/Helaas/Apostrophe/archive/refs/tags/v${APOSTROPHE_VER}.tar.gz workspace/apostrophe-${APOSTROPHE_VER}.tar.gz && touch $apostrophedlflag )
+  [ ! -d workspace/$apostrophedir ] && ( cd workspace && tar -xzf apostrophe-${APOSTROPHE_VER}.tar.gz && mv Apostrophe-${APOSTROPHE_VER} $apostrophedir )
+fi
 
 # On macOS, download the host-native Nim to workspace/nim-${NIM_VER}-host/ for local builds.
 # Do this before extracting the Linux Nim: both archives unpack as nim-${NIM_VER}/, so we

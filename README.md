@@ -60,12 +60,21 @@ This pak is tested on the following NextUI devices:
 - Cheats are installed to your NextUI Cheats folder, organized in subfolders by system tag (e.g. `GBA/`, `PS/`).
 - The cheat database is cached at `/mnt/SDCARD/.userdata/Cheat Downloader Offline/` as a local SQLite index, so searching is fast and works entirely offline after the initial download.
 - Folder-to-system mappings and your last-used game per system are remembered across sessions.
+- The UI is built on [Apostrophe](https://github.com/Helaas/Apostrophe), a C toolkit compiled directly into the app (previously it shelled out to the separate `minui-list`/`minui-presenter` binaries).
+
+## Development
+
+Building `cheat_manager` (for any platform, including `host`) requires SDL2, SDL2_ttf and SDL2_image headers/libs, since the UI toolkit (Apostrophe) links directly against them:
+
+- Debian/Ubuntu: `apt install libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev`
+- macOS: `brew install sdl2 sdl2_ttf sdl2_image`
+
+`./build-deps.sh` fetches everything else needed to build (Nim, miniz, Apostrophe's source, and the cross-compilation toolchains' Nim binaries). See `Makefile` and `build-binary.sh` for the actual build targets (`make build`, `make test`, `make test-e2e`).
 
 ## Acknowledgements
 
 - [Cheat Downloader.pak](https://github.com/mikecosentino/nextui-cheat-downloader) by Mike Cosentino
   - online-only downloader where the database is managed by the backend
-- [minui-list](https://github.com/josegonzalez/minui-list) by Jose Diaz-Gonzalez
-- [minui-presenter](https://github.com/josegonzalez/minui-presenter) by Jose Diaz-Gonzalez
+- [Apostrophe](https://github.com/Helaas/Apostrophe) by Helaas — the UI toolkit this pak's interface is built with
 - [miniz](https://github.com/richgel999/miniz) — lightweight zip library
 - [libretro-database](https://github.com/libretro/libretro-database) for the cheat files
