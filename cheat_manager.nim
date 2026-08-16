@@ -2,11 +2,13 @@
 ##
 ## Reads ROM_DIR, CACHE_DIR, CHEAT_DIR from environment.
 ## Persists state as JSON, indexes zip archives into SQLite,
-## and provides dual-mode UI (text terminal or minui-presenter/minui-list).
+## and provides dual-mode UI (text terminal or Apostrophe, a linked-in C UI
+## toolkit — see apostrophe.nim).
 
-import std/[json, osproc, os, posix, streams, strutils, strformat, algorithm]
+import std/[json, osproc, os, streams, strutils, strformat, algorithm]
 import db_connector/db_sqlite
 import miniz
+import apostrophe
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -55,10 +57,15 @@ type
     extractCheat*: proc(id: int, target: string): bool
 
   UI = object
-    killPresenter: proc(signal: cint = SIGKILL, cleanup: bool = true)
-    message: proc(text: string, timeout: int = 0)
-    messages: proc(lines: seq[string], timeout: int = 86400)
-    nextMessage: proc()
+    quit: proc()
+    showMessage: proc(text: string, timeoutSec: int = 2)
+      ## Blocks until dismissed. `timeoutSec` <= 0 is treated as a short
+      ## default wait (there's no user-dismiss gesture in the Apostrophe
+      ## backend, unlike the old minui-presenter model).
+    runTask: proc(text: string, work: proc(): bool): bool
+      ## Shows `text` as a "please wait" screen while synchronously running
+      ## `work` (a potentially slow operation — network, disk, sqlite), then
+      ## returns whatever `work` returns.
     confirm: proc(text: string, confirmText: string = "Yes",
                   cancelText: string = "No"): bool
     list: proc(title: string, items: seq[string],
@@ -82,8 +89,6 @@ var
 
 const
   CMD_CURL = "curl"
-  CMD_MINUI_PRESENTER = "minui-presenter"
-  CMD_MINUI_LIST = "minui-list"
 
   EXCLUDED_EXTS = [".txt", ".md", ".xml", ".db", ".pdf", ".cht", ".png",
                    ".jpg", ".jpeg", ".srm", ".sav"]
@@ -346,128 +351,34 @@ proc createCheatDb*(archiveFile: string): CheatDb =
 # UI namespace
 # ---------------------------------------------------------------------------
 
-proc createMinuiUi(): UI =
-  var presenterPid: int = 0
-
-  proc killPresenter(signal: cint = SIGKILL, cleanup: bool = true) =
-    if presenterPid != 0:
-      debug "killing presenter ", $presenterPid, " with ", $signal
-      discard posix.kill(Pid(presenterPid), signal)
-      if cleanup:
-        var status: cint
-        discard posix.waitpid(Pid(presenterPid), status, 0)
-        presenterPid = 0
-
-  proc message(text: string, timeout: int) =
-    killPresenter()
-    debug "message: ", text, ", timeout ", $timeout
-    if timeout <= 0:
-      let p = startProcess(CMD_MINUI_PRESENTER,
-                          args = ["--message", text, "--timeout", "-1"],
-                          options = {poUsePath})
-      presenterPid = p.processID
-    else:
-      presenterPid = 0
-      try:
-        discard execProcess(CMD_MINUI_PRESENTER,
-                            args = ["--message", text, "--timeout", $timeout],
-                            options = {poUsePath})
-      except:
-        discard
-
-  proc messages(lines: seq[string], timeout: int) =
-    killPresenter()
-    killPresenter()
-    debug "messages: ", $lines.len, " lines"
-    let jsonFile = env.cacheDir / "messages.json"
-    var items = newJArray()
-    for line in lines:
-      items.add(%*{"text": line})
-    let data = %*{"items": items}
-    writeFile(jsonFile, $data)
-    let p = startProcess(CMD_MINUI_PRESENTER,
-                        args = ["--file", jsonFile, "--disable-auto-sleep",
-                                "--timeout", $timeout],
-                        options = {poUsePath})
-    presenterPid = p.processID
-
-  proc nextMessage() =
-    killPresenter(SIGUSR1, false)
-
-  proc confirm(text: string, confirmText: string, cancelText: string): bool =
-    killPresenter()
-    let args = ["--message", text,
-                "--confirm-button", "A",
-                "--confirm-text", confirmText,
-                "--confirm-show",
-                "--cancel-button", "B",
-                "--cancel-text", cancelText,
-                "--cancel-show",
-                "--timeout", "0"]
-    let (_, exitCode) = execCmdRaw(CMD_MINUI_PRESENTER, args)
-    return exitCode == 0
-
-  proc list(title: string, items: seq[string], selectedIndex: int): int =
-    let jsonFile = env.cacheDir / "list.json"
-    var minuiItems = newJArray()
-    for item in items:
-      minuiItems.add(%*{"name": item})
-    let data = %*{"items": minuiItems, "selected": selectedIndex}
-    writeFile(jsonFile, $data)
-    killPresenter()
-    let outFile = env.cacheDir / "list_result.json"
-    try:
-      removeFile(outFile)
-    except:
-      discard
-    let args = ["--file", jsonFile, "--item-key", "items",
-                "--title", title, "--write-location", outFile,
-                "--write-value", "state"]
-    let (_, exitCode) = execCmdRaw(CMD_MINUI_LIST, args)
-    if exitCode != 0:
-      return -1
-    if not fileExists(outFile):
-      return -1
-    let content = readFile(outFile)
-    let resultJson = parseJson(content)
-    let selIdx = resultJson["selected"].getInt(-1)
-    if selIdx >= 0 and selIdx < items.len:
-      return selIdx
-    return -1
+proc createApostropheUi(): UI =
+  if not apInit("Cheat Downloader Offline"):
+    echo "Error: failed to initialize Apostrophe UI"
+    quit(1)
 
   result = UI(
-    killPresenter: killPresenter,
-    message: message,
-    messages: messages,
-    nextMessage: nextMessage,
-    confirm: confirm,
-    list: list,
+    quit: apQuit,
+    showMessage: apShowMessage,
+    runTask: apRunTask,
+    confirm: apConfirm,
+    list: apList,
   )
 
 proc createTextUi(): UI =
-  var msgLines: seq[string] = @[]
-  var msgIdx: int = 0
+  proc uiQuit() = discard
 
-  proc killPresenter(signal: cint = SIGKILL, cleanup: bool = true) = discard
-
-  proc message(text: string, timeout: int) =
+  proc showMessage(text: string, timeoutSec: int) =
     echo ""
     echo "-".repeat(40)
     echo "MESSAGE: ", text
     echo "-".repeat(40)
     echo ""
-    if timeout > 0:
-      sleep(timeout * 1000)
+    if timeoutSec > 0:
+      sleep(timeoutSec * 1000)
 
-  proc messages(lines: seq[string], timeout: int) =
-    msgLines = lines
-    msgIdx = 0
-    message(lines[0], 0)
-
-  proc nextMessage() =
-    if msgLines.len > 0:
-      msgIdx = (msgIdx + 1) mod msgLines.len
-      message(msgLines[msgIdx], 0)
+  proc runTask(text: string, work: proc(): bool): bool =
+    showMessage(text, 0)
+    work()
 
   proc confirm(text: string, confirmText: string, cancelText: string): bool =
     echo ""
@@ -501,36 +412,23 @@ proc createTextUi(): UI =
       return -1
 
   result = UI(
-    killPresenter: killPresenter,
-    message: message,
-    messages: messages,
-    nextMessage: nextMessage,
+    quit: uiQuit,
+    showMessage: showMessage,
+    runTask: runTask,
     confirm: confirm,
     list: list,
   )
 
 proc createJsonUi(): UI =
-  var msgLines: seq[string] = @[]
-  var msgIdx: int = 0
+  proc uiQuit() = discard
 
-  proc killPresenter(signal: cint = SIGKILL, cleanup: bool = true) = discard
-
-  proc message(text: string, timeout: int) =
+  proc showMessage(text: string, timeoutSec: int) =
     echo $(%*{"type": "message", "text": text})
     stdout.flushFile()
 
-  proc messages(lines: seq[string], timeout: int) =
-    msgLines = lines
-    msgIdx = 0
-    if lines.len > 0:
-      echo $(%*{"type": "message", "text": lines[0]})
-      stdout.flushFile()
-
-  proc nextMessage() =
-    if msgLines.len > 0:
-      msgIdx = (msgIdx + 1) mod msgLines.len
-      echo $(%*{"type": "message", "text": msgLines[msgIdx]})
-      stdout.flushFile()
+  proc runTask(text: string, work: proc(): bool): bool =
+    showMessage(text, 0)
+    work()
 
   proc confirm(text: string, confirmText: string, cancelText: string): bool =
     echo $(%*{"type": "confirm", "text": text,
@@ -549,10 +447,9 @@ proc createJsonUi(): UI =
     return parseJson(line)["choice"].getInt(-1)
 
   result = UI(
-    killPresenter: killPresenter,
-    message: message,
-    messages: messages,
-    nextMessage: nextMessage,
+    quit: uiQuit,
+    showMessage: showMessage,
+    runTask: runTask,
     confirm: confirm,
     list: list,
   )
@@ -560,7 +457,7 @@ proc createJsonUi(): UI =
 proc createUi(textui, jsonui: bool): UI =
   if jsonui: createJsonUi()
   elif textui: createTextUi()
-  else: createMinuiUi()
+  else: createApostropheUi()
 
 # ---------------------------------------------------------------------------
 # Helper Functions
@@ -716,14 +613,7 @@ proc checkUpdate(): string =
 proc downloadFile(url, outputPath: string): bool =
   ## Download a file from a URL to a local path. Returns true on success.
   debug "Downloading ", url, " to ", outputPath, "..."
-  var messages: seq[string] = @[]
   let fileName = extractFilename(url)
-  messages.add("Downloading cheat archive " & fileName)
-  let maxMb = 170
-  for i in 1 ..< maxMb:
-    messages.add("Downloading cheat archive " & fileName &
-                 ". Progress: " & $i & " MB of about 170 MB")
-  ui.messages(messages, -1)
 
   let tmpPath = outputPath & ".tmp"
   try:
@@ -735,53 +625,42 @@ proc downloadFile(url, outputPath: string): bool =
   except:
     discard
 
-  let curlProc = startProcess(CMD_CURL, args = ["-ksL", url],
-                              options = {poUsePath})
-  let pipe = curlProc.outputStream
+  proc doDownload(): bool =
+    let curlProc = startProcess(CMD_CURL, args = ["-ksL", url],
+                                options = {poUsePath})
+    let pipe = curlProc.outputStream
+    let fd = open(tmpPath, fmWrite)
+    var bytes: int64 = 0
+    var buf: array[65536, byte]
+    while true:
+      let n = pipe.readData(addr buf[0], buf.len)
+      if n <= 0:
+        break
+      discard fd.writeBuffer(addr buf[0], n)
+      bytes += n.int64
+    fd.close()
 
-  let fd = open(tmpPath, fmWrite)
+    let exitCode = curlProc.waitForExit()
+    curlProc.close()
+    debug "Downloaded ", $(bytes div 1048576), " MB, curl exit code ", $exitCode
 
-  var bytes: int64 = 0
-  var lastMb: int64 = 0
-  var buf: array[65536, byte]
+    if exitCode != 0:
+      debug "Download failed"
+      return false
+    if not fileExists(tmpPath) or getFileSize(tmpPath) == 0:
+      debug "Download failed"
+      return false
+    return true
 
-  while true:
-    let n = pipe.readData(addr buf[0], buf.len)
-    if n <= 0:
-      break
-    discard fd.writeBuffer(addr buf[0], n)
-    bytes += n.int64
-    let mb = bytes div 1048576
-    if mb != lastMb:
-      lastMb = mb
-      debug "Downloaded ", $mb, " MB so far..."
-      if mb < maxMb:
-        ui.nextMessage()
-      elif mb == maxMb:
-        ui.message("Downloading cheat archive " & fileName &
-                  ". Progress: " & $maxMb & "+ MB", -1)
+  let ok = ui.runTask("Downloading cheat archive " & fileName &
+                      ", this may take a few minutes...", doDownload)
 
-  fd.close()
-
-  let exitCode = curlProc.waitForExit()
-  curlProc.close()
-
-  if exitCode != 0:
-    debug "Download failed"
+  if not ok:
     try:
       removeFile(tmpPath)
     except:
       discard
-    ui.message("Download Failed!", 2)
-    return false
-
-  if not fileExists(tmpPath) or getFileSize(tmpPath) == 0:
-    debug "Download failed"
-    try:
-      removeFile(tmpPath)
-    except:
-      discard
-    ui.message("Download Failed!", 2)
+    ui.showMessage("Download Failed!", 2)
     return false
 
   moveFile(tmpPath, outputPath)
@@ -789,7 +668,7 @@ proc downloadFile(url, outputPath: string): bool =
   let size = getFileSize(outputPath)
   let mb = size div 1048576
   debug "Download complete. Final size: ", $mb, " MB"
-  ui.message("Download Complete! " & $mb & " MB", 1)
+  ui.showMessage("Download Complete! " & $mb & " MB", 1)
   return true
 
 # ---------------------------------------------------------------------------
@@ -1014,8 +893,9 @@ proc main() =
 
     of CHECK_UPDATE:
       if not offlineMode:
-        ui.message("Checking for updates...")
-        latestVersion = checkUpdate()
+        discard ui.runTask("Checking for updates...", proc(): bool =
+          latestVersion = checkUpdate()
+          true)
       currentVersion = stateStore.getCheatDbVersion()
       let dbFile = env.cacheDir / "cheats.zip"
       if currentVersion != "" and stateStore.isDbFileMissing(dbFile):
@@ -1054,10 +934,10 @@ proc main() =
       if downloadFile(url, dbFile):
         stateStore.setCheatDbVersion(latestVersion, getFileSize(dbFile))
         if not isFirstInstall:
-          ui.message("Update Complete!", 2)
+          ui.showMessage("Update Complete!", 2)
         state = INIT_DB
       elif isFirstInstall:
-        ui.message("Download Failed! Exiting.", 4)
+        ui.showMessage("Download Failed! Exiting.", 4)
         exitCode = 1
         state = EXIT
       else:
@@ -1066,15 +946,19 @@ proc main() =
     of INIT_DB:
       let dbFile = env.cacheDir / "cheats.zip"
       if not fileExists(dbFile):
-        ui.message("No cheat database available. Exiting.", 3)
+        ui.showMessage("No cheat database available. Exiting.", 3)
         exitCode = 1
         state = EXIT
         continue
-      ui.message("Checking cheat archive...")
-      try:
-        cheatDb = createCheatDb(dbFile)
-      except IOError:
-        ui.message("Failed to open cheat database. Exiting.", 5)
+      var openErr = false
+      discard ui.runTask("Checking cheat archive...", proc(): bool =
+        try:
+          cheatDb = createCheatDb(dbFile)
+        except IOError:
+          openErr = true
+        true)
+      if openErr:
+        ui.showMessage("Failed to open cheat database. Exiting.", 5)
         exitCode = 1
         state = EXIT
         continue
@@ -1083,7 +967,7 @@ proc main() =
     of SELECT_GAME_FOLDER:
       let dirs = browserListDirs(env.romDir)
       if dirs.len == 0:
-        ui.message("No supported ROM folders found. Check that your ROM folders use the 'System (TAG)' naming convention.", 5)
+        ui.showMessage("No supported ROM folders found. Check that your ROM folders use the 'System (TAG)' naming convention.", 5)
         state = EXIT
         continue
       var dirItems: seq[string] = @[]
@@ -1110,7 +994,7 @@ proc main() =
     of SELECT_GAME:
       let games = browserListGames(dirPath)
       if games.len == 0:
-        ui.message("No games found in " & dirName, 2)
+        ui.showMessage("No games found in " & dirName, 2)
         state = SELECT_GAME_FOLDER
         continue
 
@@ -1165,39 +1049,33 @@ proc main() =
       state = FIND_CHEATS
 
     of FIND_CHEATS:
-      ui.message("Searching cheats for " & mappedSystem & "...")
-      allIds = cheatDb.getAllCheats(mappedSystem)
-      var tier1: seq[int] = @[]
-      var tier2: seq[int] = @[]
-      tier3 = @[]
+      discard ui.runTask("Searching cheats for " & mappedSystem & "...", proc(): bool =
+        allIds = cheatDb.getAllCheats(mappedSystem)
+        var tier1: seq[int] = @[]
+        var tier2: seq[int] = @[]
+        tier3 = @[]
 
-      var gameTitle = gameBase
-      let pi = gameBase.find('(')
-      if pi >= 0:
-        gameTitle = gameBase[0 ..< pi].strip()
-      else:
-        gameTitle = gameBase
+        let lowGbase = gameBase.toLowerAscii()
+        let normGbase = normalizeTitle(gameBase)
 
-      let lowGbase = gameBase.toLowerAscii()
-      let normGbase = normalizeTitle(gameBase)
+        for cid in allIds:
+          let cname = cheatDb.getCheatName(cid)
+          let lowCname = cname.toLowerAscii()
+          let normCname = normalizeTitle(cname)
 
-      for cid in allIds:
-        let cname = cheatDb.getCheatName(cid)
-        let lowCname = cname.toLowerAscii()
-        let normCname = normalizeTitle(cname)
+          if lowCname.startsWith(lowGbase):
+            tier1.add(cid)
+          elif normGbase.startsWith(normCname) or normCname.startsWith(normGbase):
+            tier2.add(cid)
+          else:
+            tier3.add(cid)
 
-        if lowCname.startsWith(lowGbase):
-          tier1.add(cid)
-        elif normGbase.startsWith(normCname) or normCname.startsWith(normGbase):
-          tier2.add(cid)
-        else:
-          tier3.add(cid)
-
-      debug "Tier 1: ", tier1.join(", ")
-      debug "Tier 2: ", tier2.join(", ")
-      allMatches = tier1 & tier2
-      if allMatches.len == 0:
-        allMatches = tier3
+        debug "Tier 1: ", tier1.join(", ")
+        debug "Tier 2: ", tier2.join(", ")
+        allMatches = tier1 & tier2
+        if allMatches.len == 0:
+          allMatches = tier3
+        true)
       if allMatches.len == 0:
         state = MAP_SYSTEM
       else:
@@ -1281,16 +1159,17 @@ proc main() =
         createDir(targetDir)
 
       let targetFile = targetDir / (gameName & ".cht")
-      ui.message("Extracting cheat for " & gameBase &
-                ", may take a minute...", -1)
-      if cheatDb.extractCheat(selectedCheatId, targetFile):
-        ui.message("Installed to " & targetFile, 2)
+      let installed = ui.runTask("Extracting cheat for " & gameBase &
+                                 ", may take a minute...", proc(): bool =
+        cheatDb.extractCheat(selectedCheatId, targetFile))
+      if installed:
+        ui.showMessage("Installed to " & targetFile, 2)
       else:
-        ui.message("Installation Failed!", 2)
+        ui.showMessage("Installation Failed!", 2)
       state = SELECT_GAME
 
     of EXIT:
-      ui.killPresenter()
+      ui.quit()
       quit(exitCode)
 
 # ---------------------------------------------------------------------------

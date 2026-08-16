@@ -41,7 +41,7 @@ The application consists of four distinct modules to keep the UI decoupled from 
   4. **Download:**
      * If confirmed, construct the download URL: `https://github.com/libretro/libretro-database/archive/refs/tags/<TAG>.tar.gz`.
      * **Atomic write:** Downloads to a `.tmp` file, then renames to the final path on success. No HTTP `Range` resume is implemented.
-     * **Progress Display:** Pre-generates ~170 messages ("Downloading … N MB of about 170MB"). Reads the stream in 65 KB chunks; each time the MB count increments, calls `UI::next_message` to advance to the next pre-generated message.
+     * **Progress Display:** The whole download runs inside a single `UI::runTask` call, which shows a "please wait" screen for its duration (no live byte-count progress).
      * **On Success:** Update `dbVersion` in `state.json`.
 
 ### **B. File Browser Module (The Navigator)**
@@ -105,16 +105,12 @@ The index is rebuilt from scratch only when `metadata.archive_file` does not mat
 ### **D. UI Module (The Interface)**
 
 * **Responsibility:** Display data and capture input.
+* **Backend:** [Apostrophe](https://github.com/Helaas/Apostrophe), a header-only C UI toolkit linked directly into the binary (previously: separate `minui-list`/`minui-presenter` subprocesses driven over JSON files). A text-mode and a JSON-protocol backend also implement the same interface, for local development and the e2e test suite respectively.
 * **Abstracted Methods:**
-  * `message(text, timeout)` — display a message.
-    * `timeout = 0`: blocking (waits for user dismiss).
-    * `timeout = -1`: async / non-blocking (presenter runs in background).
-    * `timeout = N` (positive integer): auto-dismiss after N seconds.
-  * `messages(lines)` — pre-load multiple sequential messages. Writes a `messages.json` file and launches the presenter with `--file`. Each call to `next_message` (via SIGUSR1) advances to the next message.
-  * `list(title, items, selected_index)` — display a selectable list and return the chosen item's ID.
-    * `items` are dicts of the form `{id "..." text "..."}`.
-    * Returns the selected item's `id`, or empty string on cancel.
-  * `confirm(text, confirm-text, cancel-text)` — prompt for confirmation. Returns `1` if confirmed, `0` otherwise.
+  * `showMessage(text, timeoutSec)` — display a message, blocking until it auto-dismisses after `timeoutSec` seconds (no user-dismiss gesture).
+  * `runTask(text, work)` — show `text` as a "please wait" screen, synchronously run `work` (a potentially slow operation), and return whatever `work` returns.
+  * `list(title, items, selected_index)` — display a selectable list and return the chosen item's index, or `-1` on cancel.
+  * `confirm(text, confirm-text, cancel-text)` — prompt for confirmation. Returns `true` if confirmed, `false` otherwise.
 
 ## **4\. Configuration & Data Structures**
 

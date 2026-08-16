@@ -20,10 +20,6 @@ for PLATFORM in tg5040 tg5050 my355; do
   done
 
   mkdir -p "$BIN_DIR"
-  for binary in minui-list minui-presenter; do
-    cp deps/$binary-$PLATFORM "$BIN_DIR/$binary"
-  done
-
   for binary in cheat_manager; do
     cp workspace/$binary-$PLATFORM "$BIN_DIR/$binary"
   done

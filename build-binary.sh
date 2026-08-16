@@ -60,29 +60,68 @@ done
 TARGETS=$(echo $TARGETS)
 
 if $NEED_DOCKER; then
-  cp *.nim workspace/
+  cp *.nim *.c workspace/
 fi
 
 for platform in $TARGETS; do
   echo "Building $platform $BUILD_TYPE"
 
   if [ "$platform" = "host" ]; then
-    echorun $HOST_NIM c $NIM_FLAGS --nimcache:nimcache -o:$OUTPUT $SOURCE
+    HOST_NIM_FLAGS="$NIM_FLAGS"
+    # Apostrophe (see apostrophe.nim) requires SDL2/SDL2_ttf/SDL2_image on
+    # whatever machine builds cheat_manager, including host dev builds —
+    # see README.md for how to install them locally.
+    for flag in $(pkg-config --cflags sdl2 SDL2_ttf SDL2_image 2>/dev/null); do
+      HOST_NIM_FLAGS="$HOST_NIM_FLAGS --passC:$flag"
+    done
+    for flag in $(pkg-config --libs sdl2 SDL2_ttf SDL2_image 2>/dev/null); do
+      HOST_NIM_FLAGS="$HOST_NIM_FLAGS --passL:$flag"
+    done
+    echorun $HOST_NIM c $HOST_NIM_FLAGS --nimcache:nimcache -o:$OUTPUT $SOURCE
   else
+    # apostrophe.h/apostrophe_widgets.h branch on these to know which device
+    # they're building for (screen size, input mapping, etc.) — see
+    # "Platform Detection" in Apostrophe's apostrophe.h.
+    case "$platform" in
+      tg5040) PLATFORM_CFLAGS="-DPLATFORM_TG5040 -mcpu=cortex-a53 -mtune=cortex-a53" ;;
+      tg5050) PLATFORM_CFLAGS="-DPLATFORM_TG5050 -mcpu=cortex-a55 -mtune=cortex-a55" ;;
+      my355)  PLATFORM_CFLAGS="-DPLATFORM_MY355 -mcpu=cortex-a55 -mtune=cortex-a55" ;;
+      *)      PLATFORM_CFLAGS="" ;;
+    esac
+
     BUILD_SCRIPT=workspace/buildbin.sh
     NIMCACHE=nimcache
     rm -f $BUILD_SCRIPT
 
-    # clean cache to let different platforms build on the same workspace
-    echo "if [ ! -f $NIMCACHE/$platform ]; then rm -rf $NIMCACHE; fi" >> $BUILD_SCRIPT
-    echo "if [ ! -d $NIMCACHE ]; then mkdir $NIMCACHE; fi" >> $BUILD_SCRIPT
-    echo "touch $NIMCACHE/$platform" >> $BUILD_SCRIPT
+    cat > $BUILD_SCRIPT <<EOF
+set -e
+# clean cache to let different platforms build on the same workspace
+if [ ! -f $NIMCACHE/$platform ]; then rm -rf $NIMCACHE; fi
+if [ ! -d $NIMCACHE ]; then mkdir $NIMCACHE; fi
+touch $NIMCACHE/$platform
 
-    echo "nim-${NIM_VER}/bin/nim c --cpu:arm64 --os:linux --nimcache:$NIMCACHE --arm64.linux.gcc.exe:\${CROSS_ROOT}/bin/\${CROSS_COMPILE}gcc --arm64.linux.gcc.linkerexe:\${CROSS_ROOT}/bin/\${CROSS_COMPILE}gcc ${NIM_FLAGS} -o:$OUTPUT $SOURCE || exit" >> $BUILD_SCRIPT
+# The Docker toolchain sysroots ship sdl2.pc but not SDL2_ttf.pc/SDL2_image.pc
+# (the .so stubs exist, just not the pkg-config metadata) — same situation
+# Apostrophe's own ports/*/Makefile works around, so we do the same here.
+SDL_CFLAGS=\$(pkg-config --cflags sdl2)
+SDL_LDFLAGS="\$(pkg-config --libs sdl2) -lSDL2_ttf -lSDL2_image"
+
+NIM_C_FLAGS="$NIM_FLAGS"
+for flag in \$SDL_CFLAGS $PLATFORM_CFLAGS; do
+  NIM_C_FLAGS="\$NIM_C_FLAGS --passC:\$flag"
+done
+for flag in \$SDL_LDFLAGS; do
+  NIM_C_FLAGS="\$NIM_C_FLAGS --passL:\$flag"
+done
+
+nim-${NIM_VER}/bin/nim c --cpu:arm64 --os:linux --nimcache:$NIMCACHE \\
+  --arm64.linux.gcc.exe:\${CROSS_ROOT}/bin/\${CROSS_COMPILE}gcc \\
+  --arm64.linux.gcc.linkerexe:\${CROSS_ROOT}/bin/\${CROSS_COMPILE}gcc \\
+  \$NIM_C_FLAGS -o:$OUTPUT $SOURCE
+EOF
 
     docker run -v "$(pwd)/workspace/:/root/workspace" --rm "ghcr.io/loveretro/${platform}-toolchain" /bin/sh $BUILD_SCRIPT
 
-    mkdir -p deps
     cp workspace/$OUTPUT workspace/${OUTPUT}-${platform}
   fi
 done
