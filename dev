@@ -119,6 +119,10 @@ TOOLCHAIN_IMAGE = "ghcr.io/loveretro/{platform}-toolchain"
 REMOTE_ROOT = "/mnt/SDCARD/Tools"
 REMOTE_BIN_SUBDIR = "bin/arm"
 NEXTUI_PROCESS = "nextui.elf"
+# launch.sh re-runs the app when this file exists at exit. Touching it before
+# killing the app restarts it in place, which is how `run` swaps in a new
+# binary without going back through the menu.
+RESTART_FLAG = "/tmp/nextui-cheat-downloader.restart"
 
 # /proc/cpuinfo markers used to tell connected devices apart. Several TrimUI
 # board revisions share the tg5040 build; the Miyoo Flip reports only its CPU
@@ -466,11 +470,17 @@ def get_pids(device, process):
     return [pid for pid in pids if pid.isdigit()]
 
 
-def stop_app(device):
-    """Kill the app if it is running, so a new binary is picked up."""
+def stop_app(device, restart=False):
+    """Kill the app if it is running. Returns whether it was.
+
+    With restart the flag file is touched first, so the loop in launch.sh
+    starts the new binary instead of exiting to the menu.
+    """
     pids = get_pids(device, APP_BINARY)
     if not pids:
         return False
+    if restart:
+        adb_shell(device, "touch", RESTART_FLAG)
     adb_shell(device, "kill", "-KILL", *pids)
     return True
 
@@ -540,8 +550,15 @@ def install_full(device, package, delete):
 
 
 def run_on_device(device):
-    """Stop the app if it is running, then launch the freshly installed one."""
-    stop_app(device)
+    """Start the freshly installed app.
+
+    If it is already running, restarting it in place is both faster and less
+    disruptive than going back to the menu - but that relies on the installed
+    launch.sh having the restart loop, so a pak installed before that existed
+    needs one `install --full` first. Otherwise NextUI launches it.
+    """
+    if stop_app(device, restart=True):
+        return
     launch_from_nextui(device)
 
 

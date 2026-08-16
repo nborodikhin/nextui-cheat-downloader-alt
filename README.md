@@ -118,8 +118,13 @@ hyphens, and underscores. `all` expands to every platform, and `host` (also
 device, or a raw ADB serial. By default they push only the app binary, which
 is the quick path while iterating; `--full` installs the complete pak and
 `--delete` removes the installed pak first, clearing files left over from an
-older version (userdata is kept). `run` on a device stops the app if it is
-running and relaunches it through NextUI.
+older version (userdata is kept).
+
+`run` on a device restarts the app in place when it is already running:
+`launch.sh` re-runs the app if `/tmp/nextui-cheat-downloader.restart` exists
+when it exits, so a rebuilt binary can be swapped in without returning to the
+menu. Otherwise the app is launched through NextUI. A pak installed before
+that hook existed needs one `./dev install <target> --full` to pick it up.
 
 `./dev dist` produces `release/CheatDownloaderOffline-<platform>.pak.zip` for
 manual installs and the combined `release/CheatDownloaderOffline.pakz` used by
