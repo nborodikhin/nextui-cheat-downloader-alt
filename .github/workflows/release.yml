@@ -35,16 +35,13 @@ jobs:
       - name: Install host packages
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q jq zip wget unzip xz-utils gcovr
+          sudo apt-get install -y -q jq wget gcovr
 
       - name: Fetch dependencies and cross-toolchain binaries
-        run: sh build-deps.sh
-
-      - name: Add Nim to PATH
-        run: echo "PATH=${{ github.workspace }}/workspace/nim-2.2.8/bin:$PATH" >> "$GITHUB_ENV"
+        run: ./dev setup
 
       - name: Run tests with coverage
-        run: make coverage
+        run: ./dev test --coverage
 
       - name: Upload coverage report to Pages
         uses: actions/upload-pages-artifact@v3
@@ -52,7 +49,7 @@ jobs:
           path: coverage/
 
       - name: Build release artifacts
-        run: sh build-release.sh
+        run: ./dev dist --strict
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

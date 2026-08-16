@@ -1,0 +1,1302 @@
+#!/usr/bin/env python3
+"""dev - the single developer entry point for the Cheat Downloader pak.
+
+Everything a developer (or CI) needs lives here: fetching prerequisites,
+building for the host and for devices, running the test suites, packaging
+releases, and editing the version/changelog in pak.json.
+
+    ./dev setup            # download compilers, sources, and helper binaries
+    ./dev build            # host build (fast, for local testing)
+    ./dev build all        # cross-build every device platform
+    ./dev test             # unit tests
+    ./dev test --e2e       # unit + end-to-end tests
+    ./dev run              # build and run the app against a sandbox SD card
+    ./dev dist --strict    # build and package the release artifacts
+    ./dev clean            # remove generated files
+    ./dev version latest   # inspect or edit pak.json versions
+    ./dev docker tg5040    # shell into a cross-compilation toolchain
+
+How the build fits together
+---------------------------
+The app is written in Nim and compiles down to C, so a build needs three
+things: the Nim compiler, the miniz C sources that get compiled into the
+binary, and (for devices) an ARM64 cross-toolchain. Only the toolchain is
+"installed" - it is a container image pulled on demand. The Nim compiler and
+miniz are unpacked under workspace/, and the prebuilt minui-list and
+minui-presenter helper binaries land in deps/. Both directories are
+gitignored and fully reproducible from `./dev setup`.
+
+Host builds run directly on this machine and produce ./cheat_manager, which
+is what the test suites exercise. Device builds run the same Nim compiler
+inside the platform's toolchain container, which mounts workspace/ as its
+working directory - that is why the sources are copied into workspace/ and
+why every compiler path below is written relative to workspace/.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Repository layout and pinned dependency versions
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent
+
+# Versions are pinned so that local builds and CI produce identical binaries.
+# Bumping one of these is a deliberate act: delete the matching directory (or
+# run `./dev clean --deps`) and re-run `./dev setup`.
+NIM_VER = "2.2.8"
+MINIZ_VER = "3.1.1"
+MINUI_LIST_VER = "0.14.0"
+MINUI_PRESENTER_VER = "0.12.0"
+
+# Platforms that have a cross-toolchain container and a release artifact.
+DEVICE_PLATFORMS = ("tg5040", "tg5050", "my355")
+# "host" is this machine - used for the test suites and for `./dev run`.
+ALL_TARGETS = DEVICE_PLATFORMS + ("host",)
+
+# Human-friendly names accepted anywhere a target is expected. Matching
+# ignores case, spaces, hyphens, and underscores (see normalize_alias).
+ALIASES = {
+    "tg5040": ("tg5040", "5040", "brick", "brickpro", "tsp", "smartpro"),
+    "tg5050": ("tg5050", "5050", "tsps", "smartpros"),
+    "my355": ("my355", "355", "flip", "miyoo", "miyooflip"),
+    "host": ("host", "native", "local", "desktop"),
+}
+
+WORKSPACE = ROOT / "workspace"  # compilers, C sources, container scratch space
+DEPS = ROOT / "deps"  # stripped helper binaries, one per platform
+RELEASE_DIR = ROOT / "release"  # staged pak tree and release archives
+NIMCACHE = ROOT / "nimcache"  # host build cache (also holds coverage data)
+COVERAGE_DIR = ROOT / "coverage"
+
+# Nim sources. The app and the two test suites are all built the same way.
+APP_SOURCE = "cheat_manager.nim"
+UNIT_TEST_SOURCE = "cheat_manager_test.nim"
+E2E_TEST_SOURCE = "cheat_manager_e2e.nim"
+
+# Packaging names. NextUI installs a pak by extracting <name>.pak.zip into
+# /Tools/<platform>/, and the combined .pakz is what the SD card auto-installer
+# picks up from the card root. These names are referenced by the release
+# workflow and the README, so keep them stable.
+PAK_DIR_NAME = "Cheat Downloader Offline.pak"
+PAKZ_FILE_NAME = "CheatDownloaderOffline.pakz"
+PAK_ZIP_TEMPLATE = "CheatDownloaderOffline-{platform}.pak.zip"
+
+# Files copied verbatim into the pak, and the helper binaries that go next to
+# the app binary in bin/arm/.
+PAK_FILES = ("launch.sh", "README.md", "pak.json")
+PAK_HELPERS = ("minui-list", "minui-presenter")
+
+PAK_FILE = ROOT / "pak.json"
+TOOLCHAIN_IMAGE = "ghcr.io/loveretro/{platform}-toolchain"
+
+# Compiler paths, written relative to the directory the compiler runs from.
+# On the host that directory is the repository root; inside a toolchain
+# container it is /root/workspace, where the workspace/workspace self-symlink
+# created by `./dev setup` makes the very same relative paths resolve.
+MINIZ_DIR_REL = "workspace/miniz-{}".format(MINIZ_VER)
+NIM_PKGS_REL = "workspace/nim-{}/pkgs".format(NIM_VER)
+DB_CONNECTOR_REL = NIM_PKGS_REL + "/db_connector/src"
+
+# gcov/gcovr wiring for `./dev test --coverage`. Nim mangles module names, so
+# the coverage data for cheat_manager.nim lands in this specific .gcda file.
+COVERAGE_FLAGS = ("--passC:--coverage", "--passL:--coverage", "--lineDir:on")
+COVERAGE_GCDA = "@mcheat_manager.nim.c.gcda"
+
+# ROM tree created by `./dev run`. It mimics the folder shapes the app has to
+# cope with on a real SD card: tag-only folders, full names with a tag suffix,
+# multi-disc games behind an .m3u, and a mix of extensions.
+SAMPLE_ROMS = (
+    "MS/Alex Kidd in Shinobi World (USA, Europe).zip",
+    "Sega Master System (SMS)/Alex Kidd in Shinobi World (USA, Europe, Brazil).zip",
+    "Microsoft MSX (MSX)/Metal Gear 2 - Solid Snake - Konami (1990)"
+    " [English v1.4 Slot Patch] [RC-767] [7207].zip",
+    "Microsoft MSX (MSX)/Metal Gear - Konami (1987)"
+    " [Official English Translation] [RC-750] [Translated] [1474].zip",
+    "Microsoft MSX (MSX)/Metal Gear - Konami (1987)"
+    " [Official English Translation] [RC-750] [Translated] [1474].rom",
+    "Sony PlayStation (PS)/Metal Gear Solid/Metal Gear Solid [Disc1of2] [U] [SLUS-00594].chd",
+    "Sony PlayStation (PS)/Metal Gear Solid/Metal Gear Solid [Disc2of2] [U] [SLUS-00776].chd",
+    "Sony PlayStation (PS)/Metal Gear Solid/Metal Gear Solid.m3u",
+)
+DEFAULT_TEST_ROOT = Path("/tmp/CheatDownloaderOffline")
+
+
+class DevError(Exception):
+    """Expected failure: reported as a one-line error instead of a traceback."""
+
+
+class CommandHelpFormatter(argparse.HelpFormatter):
+    """Print subcommands as a plain list instead of argparse's {a,b,c} blob."""
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            format_action = super()._format_action
+            return "".join(
+                format_action(command) for command in action._get_subactions()
+            )
+        return super()._format_action(action)
+
+
+# ---------------------------------------------------------------------------
+# Process, download, and container helpers
+# ---------------------------------------------------------------------------
+
+
+def run_command(args, cwd=ROOT, env=None, capture=False, check=True):
+    """Run a command, defaulting to the repository root as working directory.
+
+    Commands are passed as a list, never through a shell, so file names with
+    spaces (of which this project has plenty) need no quoting.
+    """
+    args = [str(argument) for argument in args]
+    result = subprocess.run(
+        args,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=False,
+    )
+    if check and result.returncode:
+        if capture and result.stderr:
+            sys.stderr.write(result.stderr.decode(errors="replace"))
+        raise DevError("Command failed: " + " ".join(shlex.quote(a) for a in args))
+    return result
+
+
+def echo_run(args, **kwargs):
+    """Run a command after printing it, so build logs can be replayed by hand."""
+    print(" ".join(shlex.quote(str(argument)) for argument in args), flush=True)
+    return run_command(args, **kwargs)
+
+
+def relative(path):
+    """Format a path for display, relative to the repository when possible."""
+    path = Path(path)
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def download(url, destination, force=False):
+    """Fetch a URL to a path, skipping the work if the file is already there.
+
+    wget and curl are preferred over urllib because they resume interrupted
+    transfers and already honour the proxy settings of the environment. The
+    download goes to a .part file and is renamed only on success, so an
+    interrupted run can never leave a truncated file that looks complete.
+    """
+    destination = Path(destination)
+    if destination.exists() and not force:
+        print("  have {}".format(relative(destination)))
+        return destination
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.name + ".part")
+    if force:
+        partial.unlink(missing_ok=True)
+
+    print("  fetch {}".format(url))
+    if shutil.which("wget"):
+        command = ["wget", "-q", "--show-progress", "-c", url, "-O", str(partial)]
+    elif shutil.which("curl"):
+        command = ["curl", "-fL", "-C", "-", url, "-o", str(partial)]
+    else:
+        raise DevError("Neither wget nor curl is available to download " + url)
+
+    run_command(command)
+    partial.replace(destination)
+    return destination
+
+
+def extract(archive, destination):
+    """Unpack a .zip/.tar.* archive into a directory, creating it if needed.
+
+    shutil handles both formats and, for tarballs, restores the executable
+    bits - which matters because the Nim archives ship compiler binaries.
+    """
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    print("  unpack {} -> {}".format(relative(archive), relative(destination)))
+    shutil.unpack_archive(str(archive), str(destination))
+
+
+def container_runtime(args):
+    """Pick Docker or Podman based on the shared --podman flag."""
+    return "podman" if getattr(args, "podman", False) else "docker"
+
+
+def run_container(runtime, platform, command, check=True):
+    """Run a command inside a platform toolchain container.
+
+    workspace/ is mounted as the container's working directory, so the build
+    sees the Nim compiler, the miniz sources, and the copied Nim sources at
+    the same relative paths a host build uses.
+    """
+    container_command = [runtime, "run"]
+    # Only ask for a TTY when there is one; CI runs without it.
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        container_command.append("-it")
+    container_command.extend(
+        [
+            "-v",
+            "{}:/root/workspace".format(WORKSPACE),
+            "--rm",
+            TOOLCHAIN_IMAGE.format(platform=platform),
+        ]
+    )
+    container_command.extend(str(argument) for argument in command)
+    return run_command(container_command, check=check)
+
+
+# ---------------------------------------------------------------------------
+# Target resolution
+# ---------------------------------------------------------------------------
+
+
+def normalize_alias(value):
+    """Fold a target name to its comparison form: lowercase, no separators."""
+    return re.sub(r"[\s_-]+", "", value).lower()
+
+
+def platform_for_alias(value):
+    key = normalize_alias(value)
+    for platform, aliases in ALIASES.items():
+        if any(key == normalize_alias(alias) for alias in aliases):
+            return platform
+    return None
+
+
+def unique(values):
+    """Deduplicate while keeping the order the user asked for."""
+    return list(dict.fromkeys(values))
+
+
+def resolve_targets(values, default, allow_host=True, all_expands_to=ALL_TARGETS):
+    """Turn command-line target names into canonical platform names.
+
+    `all` expands to the platform set that makes sense for the command: every
+    target for builds, and only the device platforms for packaging.
+    """
+    values = list(values) if values else list(default)
+    targets = []
+    for value in values:
+        key = normalize_alias(value)
+        if key == "all":
+            targets.extend(all_expands_to)
+            continue
+        platform = platform_for_alias(key)
+        if not platform:
+            raise DevError("Unknown target: {}".format(value))
+        if platform == "host" and not allow_host:
+            raise DevError("host is not a valid target for this command")
+        targets.append(platform)
+    return unique(targets)
+
+
+# ---------------------------------------------------------------------------
+# setup - fetch every prerequisite
+# ---------------------------------------------------------------------------
+
+
+def prepare_workspace():
+    """Create workspace/, deps/, and the self-symlink container builds need.
+
+    Inside a toolchain container the working directory *is* workspace/, yet
+    the compiler flags say "workspace/miniz-3.1.1". The workspace/workspace
+    symlink pointing at "." makes those paths resolve in both places, so host
+    and device builds can share one set of flags.
+    """
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    DEPS.mkdir(parents=True, exist_ok=True)
+    link = WORKSPACE / "workspace"
+    if not link.exists():
+        link.symlink_to(".")
+
+
+def setup_miniz(force):
+    """Unpack the miniz C sources that get compiled into the app binary."""
+    miniz_dir = ROOT / MINIZ_DIR_REL
+    if (miniz_dir / "miniz.c").exists() and not force:
+        print("  have {}".format(relative(miniz_dir)))
+        return
+
+    archive = download(
+        "https://github.com/richgel999/miniz/releases/download/"
+        "{version}/miniz-{version}.zip".format(version=MINIZ_VER),
+        WORKSPACE / "miniz-{}.zip".format(MINIZ_VER),
+        force=force,
+    )
+    # The release zip stores miniz.c at its root, so it unpacks straight into
+    # the versioned directory the compiler flags point at.
+    extract(archive, miniz_dir)
+    if not (miniz_dir / "miniz.c").exists():
+        raise DevError("miniz.c is missing from " + relative(miniz_dir))
+
+
+def setup_nim(force):
+    """Install the Nim compiler(s).
+
+    The Linux x64 build is always needed: it is the compiler that runs inside
+    the toolchain containers, and every build - host builds included - reads
+    the db_connector package from its pkgs/ directory. On macOS a second,
+    native compiler is unpacked alongside it for host builds. Both archives
+    unpack as nim-<version>/, so the native one is extracted to a temporary
+    directory and moved into place to avoid colliding with the Linux tree.
+    """
+    linux_nim = WORKSPACE / "nim-{}".format(NIM_VER) / "bin" / "nim"
+    if not linux_nim.exists() or force:
+        package = "nim-{}-linux_x64.tar.xz".format(NIM_VER)
+        archive = download(
+            "https://nim-lang.org/download/" + package,
+            WORKSPACE / package,
+            force=force,
+        )
+        extract(archive, WORKSPACE)
+    else:
+        print("  have {}".format(relative(linux_nim.parent.parent)))
+
+    if os.uname().sysname != "Darwin":
+        return
+
+    native_dir = WORKSPACE / "nim-{}-host".format(NIM_VER)
+    if (native_dir / "bin" / "nim").exists() and not force:
+        print("  have {}".format(relative(native_dir)))
+        return
+
+    suffix = "macosx_arm64" if os.uname().machine == "arm64" else "macosx_x64"
+    package = "nim-{}-{}.tar.gz".format(NIM_VER, suffix)
+    archive = download(
+        "https://nim-lang.org/download/" + package,
+        WORKSPACE / package,
+        force=force,
+    )
+    with tempfile.TemporaryDirectory(dir=str(WORKSPACE)) as staging:
+        extract(archive, staging)
+        if native_dir.exists():
+            shutil.rmtree(native_dir)
+        shutil.move(str(Path(staging) / "nim-{}".format(NIM_VER)), str(native_dir))
+
+
+def setup_helpers(platform, runtime, force):
+    """Fetch minui-list and minui-presenter for one platform.
+
+    The published binaries carry debug info, so each one is stripped inside
+    that platform's toolchain container - the only place with a matching
+    ARM64 binutils - before being installed into deps/.
+    """
+    helpers = {
+        "minui-list": (
+            "https://github.com/josegonzalez/minui-list/releases/download/"
+            "{version}/minui-list-{platform}"
+        ).format(version=MINUI_LIST_VER, platform=platform),
+        "minui-presenter": (
+            "https://github.com/josegonzalez/minui-presenter/releases/download/"
+            "{version}/minui-presenter-{platform}"
+        ).format(version=MINUI_PRESENTER_VER, platform=platform),
+    }
+
+    for name, url in helpers.items():
+        installed = DEPS / "{}-{}".format(name, platform)
+        if installed.exists() and installed.stat().st_size and not force:
+            print("  have {}".format(relative(installed)))
+            continue
+
+        staged_name = "{}-{}".format(name, platform)
+        staged = download(url, WORKSPACE / staged_name, force=force)
+        run_container(
+            runtime,
+            platform,
+            [
+                "/bin/sh",
+                "-c",
+                # CROSS_ROOT and CROSS_COMPILE are defined by the toolchain
+                # image, so this expands inside the container, not here.
+                '${CROSS_ROOT}/bin/${CROSS_COMPILE}strip ' + shlex.quote(staged_name),
+            ],
+        )
+        shutil.copy2(staged, installed)
+        # SD cards are FAT32 and ignore permission bits, but keeping these
+        # executable makes the staged pak directory usable as-is locally.
+        installed.chmod(0o755)
+        print("  install {}".format(relative(installed)))
+
+
+def command_setup(args):
+    targets = resolve_targets(args.targets, default=["all"])
+    runtime = container_runtime(args)
+
+    print("== Preparing workspace ==", flush=True)
+    prepare_workspace()
+
+    print("== Nim {} ==".format(NIM_VER), flush=True)
+    setup_nim(args.force)
+
+    print("== miniz {} ==".format(MINIZ_VER), flush=True)
+    setup_miniz(args.force)
+
+    for platform in targets:
+        if platform == "host":
+            continue  # host builds need no per-platform helper binaries
+        print("== Helper binaries for {} ==".format(platform), flush=True)
+        setup_helpers(platform, runtime, args.force)
+
+    print("Setup complete. Try './dev build' or './dev test'.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# build - host and cross-compiled binaries
+# ---------------------------------------------------------------------------
+
+
+def host_nim():
+    """Locate the Nim compiler to use for builds on this machine."""
+    native = WORKSPACE / "nim-{}-host".format(NIM_VER) / "bin" / "nim"
+    linux = WORKSPACE / "nim-{}".format(NIM_VER) / "bin" / "nim"
+    if os.uname().sysname == "Darwin" and native.exists():
+        return native
+    if linux.exists():
+        return linux
+    raise DevError("Nim is not installed. Run './dev setup' first.")
+
+
+def nim_flags(release, extra=()):
+    """Assemble the compiler flags shared by host and device builds."""
+    flags = [
+        "--threads:off",
+        # miniz is compiled from source into the binary; the Nim wrapper needs
+        # the directory as a define and the C compiler needs it on its
+        # include path.
+        "-d:minizDir={}".format(MINIZ_DIR_REL),
+        "--passC:-I{}".format(MINIZ_DIR_REL),
+        # db_connector ships with Nim as a bundled package rather than on the
+        # default search path.
+        "-p:{}".format(DB_CONNECTOR_REL),
+    ]
+    if release:
+        # Size matters more than speed on these devices: optimise for size,
+        # strip symbols, and link with LTO. The strict-aliasing opt-out keeps
+        # miniz's type punning well-defined under LTO.
+        flags.extend(
+            [
+                "-d:release",
+                "-d:strip",
+                "--opt:size",
+                "-d:lto",
+                "--passC:-fno-strict-aliasing",
+                "--passL:-fno-strict-aliasing",
+                "--passL:-Wno-lto-type-mismatch",
+            ]
+        )
+    flags.extend(extra)
+    return flags
+
+
+def build_host(source, release=False, extra_flags=()):
+    """Compile one Nim source for this machine, into the repository root."""
+    output = Path(source).stem
+    compiler = host_nim()  # resolved first so a missing Nim fails before output
+    print("== Building {} for host ==".format(output), flush=True)
+    echo_run(
+        [
+            compiler,
+            "c",
+            *nim_flags(release, extra_flags),
+            "--nimcache:{}".format(NIMCACHE.name),
+            "-o:{}".format(output),
+            source,
+        ]
+    )
+    return ROOT / output
+
+
+def build_device(platform, runtime, source=APP_SOURCE, release=False):
+    """Cross-compile one Nim source inside a platform toolchain container."""
+    output = Path(source).stem
+    print("== Building {} for {} ==".format(output, platform), flush=True)
+
+    # The container only sees workspace/, so the sources have to live there.
+    for nim_source in ROOT.glob("*.nim"):
+        shutil.copy2(nim_source, WORKSPACE / nim_source.name)
+
+    cache = "nimcache"
+    flags = " ".join(shlex.quote(flag) for flag in nim_flags(release))
+    script = "\n".join(
+        [
+            "set -e",
+            # The cache holds C output for one platform at a time. A marker
+            # file records which one, so switching platforms starts clean
+            # instead of linking objects from the previous architecture.
+            "if [ ! -f {cache}/{platform} ]; then rm -rf {cache}; fi",
+            "mkdir -p {cache}",
+            "touch {cache}/{platform}",
+            "nim-{version}/bin/nim c --cpu:arm64 --os:linux --nimcache:{cache}"
+            " --arm64.linux.gcc.exe:${{CROSS_ROOT}}/bin/${{CROSS_COMPILE}}gcc"
+            " --arm64.linux.gcc.linkerexe:${{CROSS_ROOT}}/bin/${{CROSS_COMPILE}}gcc"
+            " {flags} -o:{output} {source}",
+        ]
+    ).format(
+        cache=cache,
+        platform=platform,
+        version=NIM_VER,
+        flags=flags,
+        output=shlex.quote(output),
+        source=shlex.quote(source),
+    )
+    run_container(runtime, platform, ["/bin/sh", "-c", script])
+
+    # Keep one binary per platform so `dist` can package them all in one pass.
+    produced = WORKSPACE / output
+    if not produced.exists():
+        raise DevError("Build produced no binary at " + relative(produced))
+    target = WORKSPACE / "{}-{}".format(output, platform)
+    shutil.copy2(produced, target)
+    print("  built {}".format(relative(target)))
+    return target
+
+
+def build_targets(targets, runtime, source=APP_SOURCE, release=False):
+    for platform in targets:
+        if platform == "host":
+            build_host(source, release=release)
+        else:
+            build_device(platform, runtime, source=source, release=release)
+
+
+def command_build(args):
+    targets = resolve_targets(args.targets, default=["host"])
+    build_targets(targets, container_runtime(args), release=args.release)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# test - unit, end-to-end, and coverage
+# ---------------------------------------------------------------------------
+
+
+def run_binary(path, env=None, extra=()):
+    """Run a freshly built binary from the repository root."""
+    command = ["./" + Path(path).name, *extra]
+    print("== Running {} ==".format(command[0]), flush=True)
+    return run_command(command, env=env)
+
+
+def command_test(args):
+    # Coverage always covers both suites, mirroring how the report is
+    # published: the two runs accumulate into a single set of .gcda files.
+    coverage = args.coverage
+    include_e2e = args.e2e or coverage
+    extra_flags = COVERAGE_FLAGS if coverage else ()
+
+    if coverage:
+        # Instrumented objects and previously collected counters have to come
+        # from the same build, so start from a clean cache. Staged release
+        # artifacts are unrelated and are left in place.
+        remove_build_output(include_release=False)
+
+    build_host(UNIT_TEST_SOURCE, extra_flags=extra_flags)
+    run_binary(UNIT_TEST_SOURCE)
+
+    if include_e2e:
+        # The end-to-end suite drives the real binary as a subprocess, so the
+        # app itself has to be built too.
+        app = build_host(APP_SOURCE, extra_flags=extra_flags)
+        build_host(E2E_TEST_SOURCE, extra_flags=extra_flags)
+        env = os.environ.copy()
+        env["CHEAT_MANAGER_BIN"] = "./" + app.name
+        run_binary(E2E_TEST_SOURCE, env=env)
+
+    if coverage:
+        write_coverage_report()
+
+    print("Tests passed.")
+    return 0
+
+
+def write_coverage_report(open_report=False):
+    """Summarise coverage on the console and write the HTML report."""
+    if not shutil.which("gcovr"):
+        raise DevError("gcovr is not installed (pip install gcovr)")
+
+    gcda = NIMCACHE / COVERAGE_GCDA
+    if not gcda.exists():
+        raise DevError("No coverage data at " + relative(gcda))
+
+    COVERAGE_DIR.mkdir(parents=True, exist_ok=True)
+    gcovr_flags = [
+        # Report on the app itself, not on the test harness or Nim's runtime.
+        "--filter",
+        APP_SOURCE,
+        # Nim's generated C references build-time paths that gcov cannot
+        # always resolve; these keep such lookups from failing the run.
+        "--gcov-ignore-errors=no_working_dir_found",
+        "--gcov-ignore-errors=source_not_found",
+        "--object-directory",
+        str(NIMCACHE.name),
+        str(gcda.relative_to(ROOT)),
+    ]
+    run_command(["gcovr", *gcovr_flags, "--print-summary"])
+    run_command(
+        [
+            "gcovr",
+            *gcovr_flags,
+            "--html",
+            "--html-details",
+            "-o",
+            str((COVERAGE_DIR / "index.html").relative_to(ROOT)),
+        ]
+    )
+    print("Coverage report: {}".format(relative(COVERAGE_DIR / "index.html")))
+
+
+# ---------------------------------------------------------------------------
+# run - exercise the app against a sandbox SD card
+# ---------------------------------------------------------------------------
+
+
+def command_run(args):
+    """Build the host binary and run it against a throwaway SD card layout.
+
+    The app reads its ROM, cheat, and cache directories from the environment
+    (launch.sh sets them from NextUI's own variables on device), so pointing
+    them at a temporary tree is enough to run the real UI locally.
+    """
+    test_root = Path(args.root).expanduser().resolve()
+    if args.reset and test_root.exists():
+        print("Removing " + str(test_root))
+        shutil.rmtree(test_root)
+
+    app = ROOT / Path(APP_SOURCE).stem
+    if args.no_build:
+        if not app.exists():
+            raise DevError(
+                "{} has not been built. Run './dev build' first.".format(relative(app))
+            )
+    else:
+        build_host(APP_SOURCE)
+
+    rom_dir = test_root / "Roms"
+    cheat_dir = test_root / "Cheats"
+    cache_dir = test_root / "Cache"
+    for directory in (rom_dir, cheat_dir, cache_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    # Empty files are enough: the app matches games by file name.
+    for rom in SAMPLE_ROMS:
+        rom_path = rom_dir / rom
+        rom_path.parent.mkdir(parents=True, exist_ok=True)
+        rom_path.touch()
+
+    env = os.environ.copy()
+    env["ROM_DIR"] = str(rom_dir)
+    env["CHEAT_DIR"] = str(cheat_dir)
+    env["CACHE_DIR"] = str(cache_dir)
+
+    # Default to the terminal UI, which needs no device hardware. Anything
+    # after `--` replaces those arguments.
+    app_args = args.app_args
+    if app_args[:1] == ["--"]:
+        app_args = app_args[1:]
+    if not app_args:
+        app_args = ["textui", "debug"]
+
+    print("Sandbox: " + str(test_root))
+    return run_command(["./" + app.name, *app_args], env=env, check=False).returncode
+
+
+# ---------------------------------------------------------------------------
+# dist - stage and archive the release artifacts
+# ---------------------------------------------------------------------------
+
+
+def stage_pak(platform, strict):
+    """Copy one platform's release files into release/Tools/<platform>/.
+
+    Layout produced here (this is exactly what lands on the SD card):
+
+        release/Tools/<platform>/Cheat Downloader Offline.pak/
+            launch.sh, README.md, pak.json
+            bin/arm/{minui-list, minui-presenter, cheat_manager}
+    """
+    tools_dir = RELEASE_DIR / "Tools" / platform
+    pak_dir = tools_dir / PAK_DIR_NAME
+    bin_dir = pak_dir / "bin" / "arm"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    missing = []
+
+    for name in PAK_FILES:
+        shutil.copy2(ROOT / name, pak_dir / name)
+
+    # Helper binaries come from `./dev setup`, the app binary from the
+    # cross-build above.
+    sources = {name: DEPS / "{}-{}".format(name, platform) for name in PAK_HELPERS}
+    app_name = Path(APP_SOURCE).stem
+    sources[app_name] = WORKSPACE / "{}-{}".format(app_name, platform)
+
+    for name, source in sources.items():
+        if not source.exists() or not source.stat().st_size:
+            missing.append(relative(source))
+            continue
+        destination = bin_dir / name
+        shutil.copy2(source, destination)
+        destination.chmod(0o755)
+
+    if missing:
+        message = "Missing build inputs for {}:\n  {}".format(
+            platform, "\n  ".join(missing)
+        )
+        # Without --strict an incomplete pak is still staged, which is useful
+        # while iterating on one platform; a release must never ship one.
+        if strict:
+            raise DevError(message)
+        print("WARNING: " + message, file=sys.stderr)
+
+    if strict:
+        # Verify the staged tree is exactly what is expected - no leftovers
+        # from an earlier run with a different layout, nothing empty.
+        expected = {Path(name) for name in PAK_FILES}
+        expected.update(Path("bin/arm") / name for name in sources)
+        actual = {
+            path.relative_to(pak_dir) for path in pak_dir.rglob("*") if path.is_file()
+        }
+        problems = []
+        if actual - expected:
+            problems.append(
+                "Unexpected files:\n  "
+                + "\n  ".join(sorted(str(path) for path in actual - expected))
+            )
+        if expected - actual:
+            problems.append(
+                "Missing files:\n  "
+                + "\n  ".join(sorted(str(path) for path in expected - actual))
+            )
+        if problems:
+            raise DevError("\n".join(problems))
+
+    return tools_dir, pak_dir
+
+
+def create_zip(archive_path, base_dir, entries):
+    """Zip `entries` (relative to base_dir) into archive_path.
+
+    zipfile records each file's mode, so launch.sh and the binaries stay
+    executable for anyone extracting the archive on a real filesystem.
+    """
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.unlink(missing_ok=True)
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for entry in entries:
+            root = base_dir / entry
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(base_dir))
+    print("Created " + relative(archive_path))
+    return archive_path
+
+
+def command_dist(args):
+    # Packaging is device-only: there is no host pak.
+    platforms = resolve_targets(
+        args.targets,
+        default=["all"],
+        allow_host=False,
+        all_expands_to=DEVICE_PLATFORMS,
+    )
+    if args.strict and set(platforms) != set(DEVICE_PLATFORMS):
+        raise DevError(
+            "--strict requires every release platform: " + ", ".join(DEVICE_PLATFORMS)
+        )
+
+    # Start from an empty release/ so stale artifacts can never be published.
+    if RELEASE_DIR.exists():
+        shutil.rmtree(RELEASE_DIR)
+
+    runtime = container_runtime(args)
+    for platform in platforms:
+        if not args.no_build:
+            build_device(platform, runtime, release=True)
+        tools_dir, _pak_dir = stage_pak(platform, strict=args.strict)
+        print("Staged " + relative(tools_dir / PAK_DIR_NAME))
+
+        if not args.no_zip:
+            # Per-platform archive for a manual install into /Tools/<platform>/.
+            create_zip(
+                RELEASE_DIR / PAK_ZIP_TEMPLATE.format(platform=platform),
+                tools_dir,
+                [PAK_DIR_NAME],
+            )
+
+    if not args.no_zip:
+        # Combined archive for the SD card auto-installer: it carries the
+        # whole Tools/ tree, so one file covers every platform.
+        create_zip(RELEASE_DIR / PAKZ_FILE_NAME, RELEASE_DIR, ["Tools"])
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# clean
+# ---------------------------------------------------------------------------
+
+
+def remove_path(path):
+    if not path.exists() and not path.is_symlink():
+        return
+    print("Removing " + relative(path))
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def remove_build_output(include_release=True):
+    """Delete build products, leaving downloaded prerequisites in place."""
+    directories = [NIMCACHE, COVERAGE_DIR, WORKSPACE / "nimcache"]
+    if include_release:
+        directories.append(RELEASE_DIR)
+    for directory in directories:
+        remove_path(directory)
+
+    binaries = [
+        Path(source).stem
+        for source in (APP_SOURCE, UNIT_TEST_SOURCE, E2E_TEST_SOURCE)
+    ]
+    for name in binaries:
+        remove_path(ROOT / name)
+
+    if not WORKSPACE.exists():
+        return
+    # Nim sources copied in for container builds, and the cross-built binaries
+    # staged beside them. The compilers and miniz sources are left alone.
+    for path in WORKSPACE.glob("*.nim"):
+        remove_path(path)
+    for name in binaries:
+        for path in WORKSPACE.glob(name + "*"):
+            remove_path(path)
+
+
+def command_clean(args):
+    remove_build_output()
+    if args.deps:
+        # Everything `./dev setup` produced: compilers, sources, helpers.
+        remove_path(WORKSPACE)
+        remove_path(DEPS)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# version - read and edit pak.json
+# ---------------------------------------------------------------------------
+
+
+def load_pak():
+    with PAK_FILE.open() as source:
+        return json.load(source)
+
+
+def save_pak(pak):
+    with PAK_FILE.open("w") as destination:
+        json.dump(pak, destination, indent=2)
+        destination.write("\n")
+
+
+def latest_version(pak):
+    """The newest version: changelog entries are stored newest-first."""
+    return next(iter(pak["changelog"]))
+
+
+def normalize_version(version):
+    return version if version.startswith("v") else "v" + version
+
+
+def version_latest(pak, _args):
+    version = latest_version(pak)
+    print("{}: {}".format(version, pak["changelog"][version]))
+    return 0
+
+
+def version_list(pak, _args):
+    for version, note in pak["changelog"].items():
+        print("{}: {}".format(version, note))
+    return 0
+
+
+def version_create(pak, args):
+    version = normalize_version(args.version)
+    text = " ".join(args.text)
+    if version in pak["changelog"]:
+        raise DevError(
+            "Version {} already exists. Use 'version update' to change its note.".format(
+                version
+            )
+        )
+
+    # The release workflow checks that pak.json's version matches the pushed
+    # tag and that the tag has a non-empty changelog note, so both fields are
+    # written together here.
+    pak["version"] = version
+    pak["changelog"] = {version: text, **pak["changelog"]}
+    save_pak(pak)
+    print("pak.json -> {}: {}".format(version, text))
+    return 0
+
+
+def version_update(pak, args):
+    version = normalize_version(args.version)
+    if version not in pak["changelog"]:
+        raise DevError("Version {} not found in changelog.".format(version))
+
+    text = " ".join(args.text)
+    pak["changelog"][version] = text
+    save_pak(pak)
+    print("Updated {}: {}".format(version, text))
+    return 0
+
+
+def version_remove(pak, args):
+    version = normalize_version(args.version)
+    if version not in pak["changelog"]:
+        raise DevError("Version {} not found in changelog.".format(version))
+
+    note = pak["changelog"][version]
+    confirmation = input(
+        'Remove {}: "{}". Type "Remove" to confirm: '.format(version, note)
+    )
+    if confirmation != "Remove":
+        print("Aborted.")
+        return 0
+
+    was_current = pak["version"] == version
+    del pak["changelog"][version]
+    if was_current:
+        if not pak["changelog"]:
+            raise DevError("No versions left after removal.")
+        pak["version"] = latest_version(pak)
+        print("Current version updated to " + pak["version"])
+
+    save_pak(pak)
+    print("Removed {}.".format(version))
+    return 0
+
+
+def command_version(args):
+    if args.version_command is None:
+        args.command_parser.print_help()
+        return 0
+    return args.version_handler(load_pak(), args)
+
+
+# ---------------------------------------------------------------------------
+# docker - drop into a toolchain
+# ---------------------------------------------------------------------------
+
+
+def command_docker(args):
+    platform = platform_for_alias(args.platform)
+    if platform not in DEVICE_PLATFORMS:
+        raise DevError("Invalid toolchain platform: " + args.platform)
+
+    prepare_workspace()
+    command = args.container_command
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        command = ["/bin/sh"]
+    return run_container(
+        container_runtime(args), platform, command, check=False
+    ).returncode
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+
+def add_podman_option(parser):
+    parser.add_argument(
+        "--podman",
+        action="store_true",
+        help="use Podman instead of Docker",
+    )
+
+
+def create_parser():
+    parser = argparse.ArgumentParser(
+        description="Build, test, and package the Cheat Downloader pak",
+        formatter_class=CommandHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(
+        dest="command",
+        title="commands",
+        metavar="command",
+    )
+
+    setup = subparsers.add_parser(
+        "setup",
+        aliases=["prepare", "deps"],
+        help="download compilers, sources, and helper binaries",
+        description="download compilers, sources, and helper binaries",
+        usage="%(prog)s [target ...] [-h] [--force] [--podman]",
+    )
+    setup.add_argument(
+        "targets",
+        nargs="*",
+        metavar="target",
+        help="one or more of all (default), host, tg5040, tg5050, my355",
+    )
+    setup.add_argument(
+        "--force",
+        action="store_true",
+        help="re-download and re-unpack even if a prerequisite is present",
+    )
+    add_podman_option(setup)
+    setup.set_defaults(handler=command_setup)
+
+    build = subparsers.add_parser(
+        "build",
+        help="build the app",
+        description="build the app",
+        usage="%(prog)s [target ...] [-h] [--release] [--podman]",
+    )
+    build.add_argument(
+        "targets",
+        nargs="*",
+        metavar="target",
+        help="one or more of host (default), tg5040, tg5050, my355, all",
+    )
+    build.add_argument(
+        "--release",
+        action="store_true",
+        help="build optimised and stripped (default: debug)",
+    )
+    add_podman_option(build)
+    build.set_defaults(handler=command_build)
+
+    test = subparsers.add_parser(
+        "test",
+        help="run the test suites",
+        description="run the test suites",
+        usage="%(prog)s [-h] [--e2e] [--coverage]",
+    )
+    test.add_argument(
+        "--e2e",
+        action="store_true",
+        help="also run the end-to-end suite against the built binary",
+    )
+    test.add_argument(
+        "--coverage",
+        action="store_true",
+        help="run both suites instrumented and write coverage/index.html",
+    )
+    test.set_defaults(handler=command_test)
+
+    run = subparsers.add_parser(
+        "run",
+        help="build and run the app against a sandbox SD card",
+        description="build and run the app against a sandbox SD card",
+        usage="%(prog)s [-h] [--root dir] [--reset] [--no-build] [-- args ...]",
+    )
+    run.add_argument(
+        "--root",
+        default=str(DEFAULT_TEST_ROOT),
+        metavar="dir",
+        help="sandbox directory (default: {})".format(DEFAULT_TEST_ROOT),
+    )
+    run.add_argument(
+        "--reset",
+        action="store_true",
+        help="delete the sandbox before running, discarding cached state",
+    )
+    run.add_argument(
+        "--no-build",
+        action="store_true",
+        help="run the existing binary instead of rebuilding it",
+    )
+    run.add_argument(
+        "app_args",
+        nargs=argparse.REMAINDER,
+        metavar="args",
+        help="arguments for the app (default: textui debug)",
+    )
+    run.set_defaults(handler=command_run)
+
+    dist = subparsers.add_parser(
+        "dist",
+        help="build and package the release artifacts",
+        description="build and package the release artifacts",
+        usage="%(prog)s [target ...] [-h] [--strict] [--no-build] [--no-zip] [--podman]",
+    )
+    dist.add_argument(
+        "targets",
+        nargs="*",
+        metavar="target",
+        help="one or more of all (default), tg5040, tg5050, my355",
+    )
+    dist.add_argument(
+        "--strict",
+        action="store_true",
+        help="require every platform and verify the staged pak exactly",
+    )
+    dist.add_argument(
+        "--no-build",
+        action="store_true",
+        help="package the binaries already in workspace/",
+    )
+    dist.add_argument(
+        "--no-zip",
+        action="store_true",
+        help="stage release/Tools without creating the archives",
+    )
+    add_podman_option(dist)
+    dist.set_defaults(handler=command_dist)
+
+    clean = subparsers.add_parser(
+        "clean",
+        help="remove generated files",
+        description="remove generated files",
+        usage="%(prog)s [-h] [--deps]",
+    )
+    clean.add_argument(
+        "--deps",
+        action="store_true",
+        help="also remove downloaded prerequisites (workspace/ and deps/)",
+    )
+    clean.set_defaults(handler=command_clean)
+
+    version = subparsers.add_parser(
+        "version",
+        help="manage app versions and changelog notes",
+        description="manage app versions and changelog notes",
+        formatter_class=CommandHelpFormatter,
+    )
+    version_commands = version.add_subparsers(
+        dest="version_command",
+        title="commands",
+        metavar="command",
+    )
+
+    version_latest_parser = version_commands.add_parser(
+        "latest",
+        help="show the current version and changelog note",
+        description="show the current version and changelog note",
+        usage="%(prog)s [-h]",
+    )
+    version_latest_parser.set_defaults(version_handler=version_latest)
+
+    version_list_parser = version_commands.add_parser(
+        "list",
+        help="list all versions and changelog notes",
+        description="list all versions and changelog notes",
+        usage="%(prog)s [-h]",
+    )
+    version_list_parser.set_defaults(version_handler=version_list)
+
+    version_create_parser = version_commands.add_parser(
+        "create",
+        help="create a version and make it current",
+        description="create a version and make it current",
+        usage="%(prog)s version text [-h]",
+    )
+    version_create_parser.add_argument("version", help="version to create")
+    version_create_parser.add_argument("text", nargs="+", help="changelog note")
+    version_create_parser.set_defaults(version_handler=version_create)
+
+    version_update_parser = version_commands.add_parser(
+        "update",
+        help="update a changelog note",
+        description="update a changelog note",
+        usage="%(prog)s version text [-h]",
+    )
+    version_update_parser.add_argument("version", help="version to update")
+    version_update_parser.add_argument("text", nargs="+", help="new changelog note")
+    version_update_parser.set_defaults(version_handler=version_update)
+
+    version_remove_parser = version_commands.add_parser(
+        "remove",
+        help="remove a version entry",
+        description="remove a version entry",
+        usage="%(prog)s version [-h]",
+    )
+    version_remove_parser.add_argument("version", help="version to remove")
+    version_remove_parser.set_defaults(version_handler=version_remove)
+
+    version.usage = "%(prog)s [-h] command args"
+    version.set_defaults(handler=command_version, command_parser=version)
+
+    docker = subparsers.add_parser(
+        "docker",
+        help="run a command in a platform toolchain",
+        description="run a command in a platform toolchain",
+        usage="%(prog)s platform [-h] [--podman] [-- command ...]",
+    )
+    add_podman_option(docker)
+    docker.add_argument(
+        "platform",
+        nargs="?",
+        default="tg5040",
+        help="one of tg5040 (default), tg5050, my355",
+    )
+    docker.add_argument(
+        "container_command",
+        nargs=argparse.REMAINDER,
+        metavar="command",
+        help="command to run in the container (default: interactive shell)",
+    )
+    docker.set_defaults(handler=command_docker)
+
+    parser.usage = "%(prog)s [-h] command args"
+    return parser
+
+
+def normalize_trailing_options(argv):
+    """Move --podman ahead of a REMAINDER argument so it is parsed as ours.
+
+    `./dev docker tg5040 --podman -- ls` reads naturally but would otherwise
+    hand --podman to the container, because argparse stops parsing at the
+    first positional.
+    """
+    argv = list(argv)
+    if argv[:1] != ["docker"]:
+        return argv
+    separator = argv.index("--") if "--" in argv else len(argv)
+    positions = [index for index in range(1, separator) if argv[index] == "--podman"]
+    if not positions:
+        return argv
+    for index in reversed(positions):
+        del argv[index]
+    argv.insert(1, "--podman")
+    return argv
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args(normalize_trailing_options(sys.argv[1:]))
+    if args.command is None:
+        parser.print_help()
+        return 0
+    try:
+        return args.handler(args)
+    except DevError as error:
+        print("ERROR: " + str(error), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
