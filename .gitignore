@@ -1,7 +1,12 @@
 .*
 !.github/
+!.gitignore
+!.dev.example
+build
 deps
+dist
+coverage
+# Trees of the build scripts before ./dev
+nimcache
 release
 workspace
-coverage
-nimcache

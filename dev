@@ -1,0 +1,1266 @@
+#!/usr/bin/env python3
+#
+# Developer entry point: dependencies, builds, tests, packages, versions, and
+# devices. Run ./dev --help for the commands.
+#
+# Configuration:
+#   Copy .dev.example to .dev
+# Configuration options:
+#   CONTAINER_RUNTIME: docker (default) or podman
+#     Could be set per call with --docker or --podman
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+# Every device platform. A new platform is one entry here, one in ALIASES, and
+# `./dev deps update` to record the hashes of its MinUI helpers.
+DEVICE_PLATFORMS = ("tg5040", "tg5050", "my355", "h700")
+HOST = "host"
+BUILD_KINDS = ("debug", "release")
+APP_NAME = "cheat_manager"
+TEST_NAME = "cheat_manager_test"
+E2E_NAME = "cheat_manager_e2e"
+PAK_NAME = "Cheat Downloader Offline.pak"
+PAKZ_BASE = "CheatDownloaderOffline"
+# Files of the pak that are the same on every platform.
+PAK_FILES = ("launch.sh", "README.md", "pak.json")
+# MinUI helpers that the pak carries in bin/arm next to the app.
+HELPER_DEPENDENCIES = ("minui-list", "minui-presenter")
+REMOTE_ROOT = "/mnt/SDCARD/Tools"
+CONTAINER_PROJECT = "/root/workspace/nextui-cheat-downloader"
+BUILD_DIR = ROOT / "build"
+DEPS_DIR = ROOT / "deps"
+DIST_DIR = ROOT / "dist"
+COVERAGE_DIR = ROOT / "coverage"
+DEPS_MANIFEST = ROOT / "deps.json"
+PAK_FILE = ROOT / "pak.json"
+DEV_CONFIG_FILE = ROOT / ".dev"
+DEFAULT_CONTAINER_RUNTIME = "docker"
+FETCHED_MARKER = ".fetched"
+DOWNLOADS_DIR = DEPS_DIR / ".downloads"
+# Some download hosts refuse the default urllib agent.
+USER_AGENT = "nextui-cheat-downloader-dev"
+
+ALIASES = {
+    "tg5040": ("tg5040", "5040", "brick", "brickpro", "tsp", "smartpro"),
+    "tg5050": ("tg5050", "5050", "tsps", "smartpros"),
+    "my355": ("my355", "355", "flip", "miyooflip", "miyoo"),
+    "h700": ("h700", "rgxx", "rgsp", "rg", "anbernic"),
+    HOST: ("host", "desktop"),
+}
+
+CPUINFO_PLATFORMS = {
+    "TG5040": "tg5040",
+    "TG3040": "tg5040",
+    "TG4040": "tg5040",
+    "TG5050": "tg5050",
+    "0xd05": "my355",
+}
+
+NIM_FLAGS = ("--threads:off",)
+RELEASE_NIM_FLAGS = (
+    "-d:release", "-d:strip", "--opt:size", "-d:lto",
+    "--passC:-fno-strict-aliasing", "--passL:-fno-strict-aliasing",
+    "--passL:-Wno-lto-type-mismatch",
+)
+COVERAGE_NIM_FLAGS = ("--passC:--coverage", "--passL:--coverage", "--lineDir:on")
+
+
+class DevError(Exception):
+    pass
+
+
+def sorted_subactions(action):
+    """Returns the commands of a subparsers action in alphabetical order of their
+    primary names. An alias gets no entry of its own."""
+    return sorted(action._get_subactions(), key=lambda command: command.dest)
+
+
+class CommandHelpFormatter(argparse.HelpFormatter):
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            format_action = super()._format_action
+            return "".join(
+                format_action(command) for command in sorted_subactions(action)
+            )
+        return super()._format_action(action)
+
+
+@dataclass(frozen=True)
+class Device:
+    serial: str
+    state: str
+    platform: str = "unknown"
+    hardware: str = "-"
+
+
+def load_container_runtime():
+    runtime = DEFAULT_CONTAINER_RUNTIME
+    if not DEV_CONFIG_FILE.exists():
+        return runtime
+
+    for line_number, raw_line in enumerate(
+        DEV_CONFIG_FILE.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise DevError(".dev:{}: expected KEY=VALUE".format(line_number))
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key != "CONTAINER_RUNTIME":
+            raise DevError(".dev:{}: unknown setting {}".format(line_number, key))
+        runtime = value
+
+    if runtime not in ("docker", "podman"):
+        raise DevError(".dev: CONTAINER_RUNTIME must be docker or podman")
+    return runtime
+
+
+def container_runtime(args):
+    return getattr(args, "container_runtime", None) or load_container_runtime()
+
+
+def run_command(args, cwd=ROOT, env=None, capture=False, check=True):
+    result = subprocess.run(
+        [str(arg) for arg in args],
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=False,
+    )
+    if check and result.returncode:
+        if capture and result.stderr:
+            sys.stderr.write(result.stderr.decode(errors="replace"))
+        raise DevError("Command failed: " + shlex.join(str(a) for a in args))
+    return result
+
+
+def unique(values):
+    return list(dict.fromkeys(values))
+
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Dependency:
+    """One pinned download from deps.json.
+
+    `url` may name {version} and {platform}. With {platform}, the dependency is
+    one file per device platform and `sha256` maps each platform to its hash;
+    otherwise `sha256` is the hash of the one file. `unpack` is "tar", "zip",
+    or empty for a single executable file.
+    """
+
+    name: str
+    version: str
+    url: str
+    github: str
+    sha256: object
+    unpack: str = ""
+    latest: str = "release"
+    tag_prefix: str = ""
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def per_platform(self):
+        return "{platform}" in self.url
+
+    @property
+    def root(self):
+        return DEPS_DIR / "{}-{}".format(self.name, self.version)
+
+    def file_url(self, platform=None):
+        return self.url.format(version=self.version, platform=platform)
+
+    def expected_hashes(self):
+        """Gives {platform or None: sha256} for every file of the dependency."""
+        if not self.per_platform:
+            return {None: self.sha256 or ""}
+        hashes = self.sha256 if isinstance(self.sha256, dict) else {}
+        return {platform: hashes.get(platform, "") for platform in DEVICE_PLATFORMS}
+
+    def path(self, platform=None):
+        """The fetched file of `platform`, or the unpacked tree."""
+        if self.per_platform:
+            return self.root / platform / self.name
+        return self.root
+
+    def to_json(self):
+        entry = dict(self.extra)
+        entry.update({"name": self.name, "version": self.version, "github": self.github})
+        if self.latest != "release":
+            entry["latest"] = self.latest
+        if self.tag_prefix:
+            entry["tag_prefix"] = self.tag_prefix
+        entry["url"] = self.url
+        if self.unpack:
+            entry["unpack"] = self.unpack
+        entry["sha256"] = self.sha256
+        return entry
+
+
+def load_dependencies():
+    if not DEPS_MANIFEST.exists():
+        raise DevError("Missing " + DEPS_MANIFEST.name)
+    try:
+        manifest = json.loads(DEPS_MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise DevError("{}: {}".format(DEPS_MANIFEST.name, error))
+
+    dependencies = []
+    known = {"name", "version", "url", "github", "sha256", "unpack", "latest", "tag_prefix"}
+    for index, entry in enumerate(manifest.get("dependencies", [])):
+        missing = [key for key in ("name", "version", "url", "github") if key not in entry]
+        if missing:
+            raise DevError("{}: dependency {} is missing {}".format(
+                DEPS_MANIFEST.name, index, ", ".join(missing)))
+        dependencies.append(Dependency(
+            name=entry["name"],
+            version=entry["version"],
+            url=entry["url"],
+            github=entry["github"],
+            sha256=entry.get("sha256", ""),
+            unpack=entry.get("unpack", ""),
+            latest=entry.get("latest", "release"),
+            tag_prefix=entry.get("tag_prefix", ""),
+            extra={key: value for key, value in entry.items() if key not in known},
+        ))
+    return dependencies
+
+
+def save_dependencies(dependencies):
+    content = json.dumps(
+        {"dependencies": [dependency.to_json() for dependency in dependencies]}, indent=2)
+    DEPS_MANIFEST.write_text(content + "\n", encoding="utf-8")
+
+
+def dependency(name):
+    for candidate in load_dependencies():
+        if candidate.name == name:
+            return candidate
+    raise DevError("{} names no dependency {}".format(DEPS_MANIFEST.name, name))
+
+
+def selected_dependencies(name):
+    dependencies = load_dependencies()
+    if name is None:
+        return dependencies
+    return [entry for entry in dependencies if entry.name == name] or [dependency(name)]
+
+
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def github_request(path):
+    request = urllib.request.Request("https://api.github.com" + path)
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("User-Agent", USER_AGENT)
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        request.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except (urllib.error.URLError, json.JSONDecodeError) as error:
+        raise DevError("GitHub API {}: {}".format(path, error))
+
+
+def cached_download(entry, platform=None):
+    """Download one file of `entry` into deps/.downloads, unless it is there.
+    `deps update` hashes the file and `deps fetch` then uses it, thus each file
+    is downloaded once."""
+    url = entry.file_url(platform)
+    name = "{}-{}-{}".format(entry.name, entry.version, platform or url.rsplit("/", 1)[-1])
+    destination = DOWNLOADS_DIR / name
+    if destination.exists():
+        return destination
+    return download(url, destination)
+
+
+def download(url, destination):
+    print("Downloading " + url, flush=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.name + ".part")
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(request, timeout=60) as response, partial.open("wb") as out:
+            shutil.copyfileobj(response, out)
+    except urllib.error.URLError as error:
+        partial.unlink(missing_ok=True)
+        raise DevError("Download of {} failed: {}".format(url, error))
+    partial.replace(destination)
+    return destination
+
+
+def version_key(version):
+    return tuple(int(part) for part in re.findall(r"\d+", version))
+
+
+def latest_version(entry):
+    if entry.latest == "tags":
+        tags = github_request("/repos/{}/tags?per_page=100".format(entry.github))
+        pattern = re.compile(re.escape(entry.tag_prefix) + r"(\d+\.\d+\.\d+)\Z")
+        versions = [match.group(1) for match in
+                    (pattern.match(tag["name"]) for tag in tags) if match]
+        if not versions:
+            raise DevError("{} has no version tags".format(entry.github))
+        return max(versions, key=version_key)
+    tag = github_request("/repos/{}/releases/latest".format(entry.github))["tag_name"]
+    if entry.tag_prefix and tag.startswith(entry.tag_prefix):
+        tag = tag[len(entry.tag_prefix):]
+    return tag
+
+
+def unpack_archive(entry, archive, destination):
+    staging = Path(tempfile.mkdtemp(prefix="unpack-", dir=DEPS_DIR))
+    try:
+        if entry.unpack == "tar":
+            with tarfile.open(archive) as bundle:
+                bundle.extractall(staging, filter="data")
+        elif entry.unpack == "zip":
+            with zipfile.ZipFile(archive) as bundle:
+                bundle.extractall(staging)
+        else:
+            raise DevError("{}: unknown unpack kind {!r}".format(entry.name, entry.unpack))
+        children = list(staging.iterdir())
+        # An archive with one top directory gives that directory as the tree.
+        tree = children[0] if len(children) == 1 and children[0].is_dir() else staging
+        tree.rename(destination)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def fetch_dependency(entry):
+    """Download, check, and unpack one dependency. Does nothing when the tree
+    on disk came from the same hashes."""
+    hashes = entry.expected_hashes()
+    unhashed = [platform or entry.name for platform, value in hashes.items() if not value]
+    if unhashed:
+        raise DevError("{} {} has no sha256 for {}. Run ./dev deps update {}.".format(
+            entry.name, entry.version, ", ".join(unhashed), entry.name))
+
+    marker = entry.root / FETCHED_MARKER
+    stamp = json.dumps({str(key): value for key, value in hashes.items()}, sort_keys=True)
+    if marker.exists() and marker.read_text() == stamp:
+        return False
+
+    DEPS_DIR.mkdir(parents=True, exist_ok=True)
+    if entry.root.exists():
+        shutil.rmtree(entry.root)
+    downloads = {platform: cached_download(entry, platform) for platform in hashes}
+    for platform, downloaded in downloads.items():
+        check_hash(entry, downloaded, hashes[platform], entry.file_url(platform))
+    if entry.per_platform:
+        for platform, downloaded in downloads.items():
+            target = entry.path(platform)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(downloaded), target)
+            target.chmod(0o755)
+    elif entry.unpack:
+        unpack_archive(entry, downloads[None], entry.root)
+        downloads[None].unlink()
+    else:
+        entry.root.mkdir(parents=True)
+        shutil.move(str(downloads[None]), entry.root / entry.name)
+    marker.write_text(stamp)
+    print("Fetched {} {}".format(entry.name, entry.version), flush=True)
+    return True
+
+
+def check_hash(entry, path, expected, url):
+    actual = sha256_of(path)
+    if actual != expected:
+        path.unlink()
+        raise DevError("{}: sha256 mismatch for {}\n  expected {}\n  actual   {}".format(
+            entry.name, url, expected, actual))
+
+
+def ensure_dependencies(names=None):
+    for entry in load_dependencies():
+        if names is None or entry.name in names:
+            fetch_dependency(entry)
+
+
+def update_dependency(entry, version):
+    """Pin `entry` to `version` (the latest release when None) and record the
+    hash of every file. Gives True when deps.json changed."""
+    target = version or latest_version(entry)
+    if target == entry.version and all(entry.expected_hashes().values()):
+        print("{} {} is current".format(entry.name, entry.version))
+        return False
+
+    previous = entry.version
+    entry.version = target
+    if entry.per_platform:
+        entry.sha256 = {platform: sha256_of(cached_download(entry, platform))
+                        for platform in DEVICE_PLATFORMS}
+    else:
+        entry.sha256 = sha256_of(cached_download(entry))
+    if previous == target:
+        print("{} {}: recorded hashes".format(entry.name, target))
+    else:
+        print("{} {} -> {}".format(entry.name, previous, target))
+    return True
+
+
+def command_deps_list(_args):
+    for entry in load_dependencies():
+        marker = entry.root / FETCHED_MARKER
+        state = "fetched" if marker.exists() else "not fetched"
+        print("{:16} {:10} {:12} {}".format(entry.name, entry.version, state, entry.github))
+    return 0
+
+
+def command_deps_fetch(args):
+    for entry in selected_dependencies(args.name):
+        if not fetch_dependency(entry):
+            print("{} {} is up to date".format(entry.name, entry.version))
+    return 0
+
+
+def command_deps_outdated(_args):
+    outdated = 0
+    for entry in load_dependencies():
+        latest = latest_version(entry)
+        if latest != entry.version:
+            outdated += 1
+        print("{:16} {:10} latest {}".format(entry.name, entry.version, latest))
+    return 1 if outdated else 0
+
+
+def command_deps_update(args):
+    if args.version and not args.name:
+        raise DevError("--version needs a dependency name")
+    dependencies = load_dependencies()
+    if args.name and args.name not in [entry.name for entry in dependencies]:
+        raise DevError("{} names no dependency {}".format(DEPS_MANIFEST.name, args.name))
+    changed = [entry for entry in dependencies
+               if args.name in (None, entry.name) and update_dependency(entry, args.version)]
+    if changed:
+        save_dependencies(dependencies)
+        for entry in changed:
+            fetch_dependency(entry)
+    return 0
+
+
+def command_deps(args):
+    args.command_parser.print_help()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Platforms and devices
+# ---------------------------------------------------------------------------
+
+def normalize_alias(value):
+    return re.sub(r"[\s_-]+", "", value).lower()
+
+
+def platform_for_alias(value):
+    key = normalize_alias(value)
+    for platform, aliases in ALIASES.items():
+        if any(key == normalize_alias(alias) for alias in aliases):
+            return platform
+    return None
+
+
+def resolve_platforms(values, default, allow_host=True):
+    platforms = []
+    for value in values or list(default):
+        if normalize_alias(value) == "all":
+            platforms.extend(DEVICE_PLATFORMS)
+            continue
+        platform = platform_for_alias(value)
+        if not platform:
+            raise DevError("Unknown platform: " + value)
+        if platform == HOST and not allow_host:
+            raise DevError("host is not valid for this command")
+        platforms.append(platform)
+    return unique(platforms)
+
+
+def adb(device, *args, check=True):
+    """Run ADB and return stdout as a list of lines.
+
+    ADB emits CRLF on some hosts; carriage returns are removed before splitting.
+    """
+    command = ["adb"]
+    if device is not None:
+        command.extend(["-s", device.serial])
+    command.extend(str(arg) for arg in args)
+    result = run_command(command, capture=True, check=check)
+    return result.stdout.decode(errors="replace").replace("\r", "").splitlines()
+
+
+def adb_shell(device, *args, check=True):
+    """Run one safely quoted device command and return normalized output lines."""
+    return adb(device, "shell", shlex.join(str(arg) for arg in args), check=check)
+
+
+def list_devices():
+    devices = []
+    for line in adb(None, "devices")[1:]:
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        device = Device(serial=fields[0], state=fields[1])
+        if device.state == "device":
+            device = detect_device(device)
+        devices.append(device)
+    return devices
+
+
+def detect_device(device):
+    cpuinfo = "\n".join(adb_shell(device, "cat", "/proc/cpuinfo", check=False))
+    for identifier, platform in CPUINFO_PLATFORMS.items():
+        if identifier in cpuinfo:
+            return Device(device.serial, device.state, platform, identifier)
+
+    # Match the platform check in the NextUI updater.
+    model = "\n".join(adb_shell(device, "cat", "/proc/device-tree/model", check=False))
+    if "sun50iw9" in model:
+        return Device(device.serial, device.state, "h700", model.replace("\0", "").strip())
+    return device
+
+
+def resolve_devices(values):
+    """Gives the connected devices that `values` select: platforms, aliases,
+    ADB serials, or "device" for every supported device."""
+    devices = list_devices()
+    ready = [device for device in devices if device.state == "device"]
+    by_serial = {device.serial: device for device in devices}
+    targets = []
+    for value in values or ["device"]:
+        if normalize_alias(value) == "device":
+            selected = [device for device in ready if device.platform in DEVICE_PLATFORMS]
+            if not selected:
+                raise DevError("No supported ADB devices are connected")
+            targets.extend(selected)
+            continue
+        platform = platform_for_alias(value)
+        if platform in DEVICE_PLATFORMS:
+            selected = [device for device in ready if device.platform == platform]
+            if not selected:
+                raise DevError("No connected device matches " + platform)
+            targets.extend(selected)
+            continue
+        device = by_serial.get(value)
+        if not device:
+            raise DevError("Unknown platform, alias, or ADB serial: " + value)
+        if device.state != "device":
+            raise DevError("ADB device {} is {}".format(value, device.state))
+        if device.platform not in DEVICE_PLATFORMS:
+            raise DevError("Could not detect the platform for ADB device " + value)
+        targets.append(device)
+    return list({device.serial: device for device in targets}.values())
+
+
+def remote_pak_path(platform):
+    return "{}/{}/{}".format(REMOTE_ROOT, platform, PAK_NAME)
+
+
+def get_pids(device, process):
+    lines = adb_shell(device, "pidof", process, check=False)
+    return [pid for pid in " ".join(lines).split() if pid.isdigit()]
+
+
+def stop_app(device):
+    pids = get_pids(device, APP_NAME)
+    if pids:
+        adb_shell(device, "kill", "-KILL", *pids)
+    return bool(pids)
+
+
+def wait_for_nextui(device, timeout=8.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pids = get_pids(device, "nextui.elf")
+        if pids:
+            return pids
+        time.sleep(0.25)
+    return []
+
+
+def launch_from_nextui(device):
+    """Make NextUI start the pak: NextUI runs the command in /tmp/next when it
+    restarts."""
+    stop_app(device)
+    pids = wait_for_nextui(device)
+    if not pids:
+        raise DevError("nextui.elf is not running on {}. Launch the pak manually."
+                       .format(device.serial))
+    launch_command = "'{}/launch.sh'".format(remote_pak_path(device.platform))
+    with tempfile.TemporaryDirectory(prefix="next-", dir=BUILD_DIR) as temp_dir:
+        next_file = Path(temp_dir) / "next"
+        next_file.write_text(launch_command)
+        adb(device, "push", next_file, "/tmp/next")
+    adb_shell(device, "kill", "-KILL", *pids)
+
+
+# ---------------------------------------------------------------------------
+# Versions
+# ---------------------------------------------------------------------------
+
+VERSION_NUMBER = r"(0|[1-9][0-9]*)"
+VERSION_CORE = r"v" + r"\.".join([VERSION_NUMBER] * 3)
+STABLE_VERSION = re.compile(VERSION_CORE + r"\Z", re.ASCII)
+OFFICIAL_VERSION = re.compile(VERSION_CORE + r"(-[a-z]+\." + VERSION_NUMBER + r")?\Z", re.ASCII)
+BUILD_VERSION = re.compile(VERSION_CORE + r"(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"
+                           r"(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?\Z", re.ASCII)
+VERSION_FORM = "vMAJOR.MINOR.PATCH[-pre-release][+build], no leading zeros, at most 31 characters"
+# A derived version adds "+" and a build identifier of up to seven characters to a release tag.
+RELEASE_TAG_MAX = 23
+
+
+def checked_version(value):
+    valid = isinstance(value, str) and len(value) <= 31 and BUILD_VERSION.fullmatch(value)
+    if valid and "-" in value.split("+", 1)[0]:
+        identifiers = value.split("+", 1)[0].split("-", 1)[1].split(".")
+        valid = all(not (item.isdigit() and len(item) > 1 and item[0] == "0")
+                    for item in identifiers)
+    if not valid:
+        raise DevError("Invalid version {!r}. Expected {}.".format(value, VERSION_FORM))
+    return value
+
+
+def official_version_order(value):
+    core, separator, prerelease = value[1:].partition("-")
+    numbers = tuple((len(part), part) for part in core.split("."))
+    if not separator:
+        return numbers, 1, ()
+    label, number = prerelease.split(".")
+    return numbers, 0, (label, len(number), number)
+
+
+def app_version(requested, identifier="local"):
+    """The version to bake into the binary. "auto" gives the newest release tag
+    merged into HEAD (or the pak.json version without one) plus "+identifier"."""
+    if requested != "auto":
+        return checked_version(requested)
+    tags = []
+    try:
+        checkout = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--show-toplevel"],
+                                  capture_output=True, text=True)
+        if checkout.returncode == 0 and Path(checkout.stdout.strip()).resolve() == ROOT:
+            result = subprocess.run(["git", "-C", str(ROOT), "tag", "--merged", "HEAD"],
+                                    capture_output=True, text=True)
+            if result.returncode == 0:
+                tags = [tag for tag in result.stdout.splitlines()
+                        if OFFICIAL_VERSION.fullmatch(tag)]
+    except FileNotFoundError:
+        pass
+    if tags:
+        base = max(tags, key=official_version_order)
+    else:
+        base = load_pak().get("version")
+        if not isinstance(base, str) or not STABLE_VERSION.fullmatch(base):
+            raise DevError("pak.json must give a stable version, got {!r}.".format(base))
+    return checked_version(base + "+" + identifier)
+
+
+def load_pak():
+    with PAK_FILE.open() as source:
+        return json.load(source)
+
+
+def save_pak(pak):
+    with PAK_FILE.open("w") as destination:
+        json.dump(pak, destination, indent=2)
+        destination.write("\n")
+
+
+def normalize_version(version):
+    return version if version.startswith("v") else "v" + version
+
+
+def check_release_tag(tag):
+    if not OFFICIAL_VERSION.fullmatch(tag) or len(tag) > RELEASE_TAG_MAX:
+        raise DevError("Invalid release tag {!r}. Expected vMAJOR.MINOR.PATCH or "
+                       "vMAJOR.MINOR.PATCH-<lowercase-label>.N, with no leading zeros, "
+                       "at most {} characters.".format(tag, RELEASE_TAG_MAX))
+
+
+def version_get(_pak, args):
+    print(app_version("auto", args.identifier))
+    return 0
+
+
+def version_validate_release(pak, args):
+    tag = args.tag
+    check_release_tag(tag)
+    stable = pak.get("version")
+    if not isinstance(stable, str) or not STABLE_VERSION.fullmatch(stable):
+        raise DevError("pak.json must give a stable version, got {!r}.".format(stable))
+    if STABLE_VERSION.fullmatch(tag):
+        if tag != stable:
+            raise DevError("Stable tag {} differs from pak.json version {}.".format(tag, stable))
+        note = pak.get("changelog", {}).get(tag)
+        if not isinstance(note, str) or not note:
+            raise DevError("pak.json changelog has no note for {}.".format(tag))
+    print("{} is a valid {}.".format(
+        tag, "stable release" if STABLE_VERSION.fullmatch(tag) else "pre-release"))
+    return 0
+
+
+def version_note(pak, args):
+    """Print the changelog note of a version; prints nothing when there is none,
+    thus a pre-release falls back to generated notes."""
+    note = pak.get("changelog", {}).get(args.version)
+    if note:
+        print(note)
+    return 0
+
+
+def version_latest(pak, _args):
+    version = next(iter(pak["changelog"]))
+    print("{}: {}".format(version, pak["changelog"][version]))
+    return 0
+
+
+def version_list(pak, _args):
+    for version, note in pak["changelog"].items():
+        print("{}: {}".format(version, note))
+    return 0
+
+
+def version_create(pak, args):
+    version = normalize_version(args.version)
+    if not STABLE_VERSION.fullmatch(version):
+        raise DevError("Release preparation requires a stable version. "
+                       "A pre-release is a tag push, with no version create.")
+    check_release_tag(version)
+    if version in pak["changelog"]:
+        raise DevError("Version {} already exists. Use 'version update' to change its note."
+                       .format(version))
+    text = " ".join(args.text)
+    pak["version"] = version
+    pak["changelog"] = {version: text, **pak["changelog"]}
+    save_pak(pak)
+    print("pak.json -> {}: {}".format(version, text))
+    return 0
+
+
+def version_update(pak, args):
+    version = normalize_version(args.version)
+    if version not in pak["changelog"]:
+        raise DevError("Version {} not found in changelog.".format(version))
+    text = " ".join(args.text)
+    pak["changelog"][version] = text
+    save_pak(pak)
+    print("Updated {}: {}".format(version, text))
+    return 0
+
+
+def version_remove(pak, args):
+    version = normalize_version(args.version)
+    if version not in pak["changelog"]:
+        raise DevError("Version {} not found in changelog.".format(version))
+    note = pak["changelog"][version]
+    confirmation = input('Remove {}: "{}". Type "Remove" to confirm: '.format(version, note))
+    if confirmation != "Remove":
+        print("Aborted.")
+        return 0
+
+    if pak["version"] == version:
+        stable_versions = [key for key in pak["changelog"]
+                           if key != version and STABLE_VERSION.fullmatch(key)]
+        if not stable_versions:
+            raise DevError("No stable versions left after removal.")
+        pak["version"] = max(stable_versions, key=official_version_order)
+        print("Current version updated to " + pak["version"])
+    del pak["changelog"][version]
+    save_pak(pak)
+    print("Removed {}.".format(version))
+    return 0
+
+
+def command_version(args):
+    if args.version_command is None:
+        args.command_parser.print_help()
+        return 0
+    return args.version_handler(load_pak(), args)
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+def output_dir(platform, kind):
+    return BUILD_DIR / kind / platform
+
+
+def nim_flags(kind, version, root):
+    """Compiler flags with the dependency paths under `root` (the repository on
+    the host, or its mount point in a container)."""
+    nim = dependency("nim")
+    miniz = "{}/deps/miniz-{}".format(root, dependency("miniz").version)
+    flags = list(NIM_FLAGS) + [
+        "-d:minizDir=" + miniz,
+        "--passC:-I" + miniz,
+        "-p:{}/deps/nim-{}/pkgs/db_connector/src".format(root, nim.version),
+        "-d:appVersion=" + version,
+    ]
+    if kind == "release":
+        flags.extend(RELEASE_NIM_FLAGS)
+    elif kind == "coverage":
+        flags.extend(COVERAGE_NIM_FLAGS)
+    return flags
+
+
+def build_host(kind, version, sources=(APP_NAME,)):
+    """Compile `sources` for the host. All of them share one nimcache, thus a
+    coverage run merges the counters of every binary."""
+    out = output_dir(HOST, kind)
+    nim = dependency("nim").path() / "bin" / "nim"
+    for source in sources:
+        run_command([nim, "c", *nim_flags(kind, version, ROOT),
+                     "--nimcache:" + str(out / "nimcache"),
+                     "-o:" + str(out / source), source + ".nim"])
+    return out
+
+
+def run_container(runtime, platform, command):
+    container_command = [runtime, "run", "--rm"]
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        container_command.append("-it")
+    container_command.extend([
+        "-v", "{}:{}".format(ROOT, CONTAINER_PROJECT),
+        "-w", CONTAINER_PROJECT,
+        "ghcr.io/loveretro/{}-toolchain".format(platform),
+    ])
+    container_command.extend(command)
+    return run_command(container_command)
+
+
+def build_device(platform, runtime, kind, version):
+    out = output_dir(platform, kind)
+    out.mkdir(parents=True, exist_ok=True)
+    container_out = "{}/build/{}/{}".format(CONTAINER_PROJECT, kind, platform)
+    nim = "{}/deps/nim-{}/bin/nim".format(CONTAINER_PROJECT, dependency("nim").version)
+    gcc = "${CROSS_ROOT}/bin/${CROSS_COMPILE}gcc"
+    command = [
+        nim, "c", "--cpu:arm64", "--os:linux",
+        "--arm64.linux.gcc.exe:" + gcc,
+        "--arm64.linux.gcc.linkerexe:" + gcc,
+        *nim_flags(kind, version, CONTAINER_PROJECT),
+        "--nimcache:" + container_out + "/nimcache",
+        "-o:" + container_out + "/" + APP_NAME,
+        APP_NAME + ".nim",
+    ]
+    # The shell expands the CROSS_* variables of the image; everything else is
+    # quoted as-is.
+    steps = [" ".join(arg if "${CROSS_" in arg else shlex.quote(arg) for arg in command)]
+    # The MinUI helper releases keep their debug info; the pak needs none of it.
+    for name in HELPER_DEPENDENCIES:
+        source = dependency(name).path(platform).relative_to(ROOT)
+        target = shlex.quote("{}/{}".format(container_out, name))
+        steps.append("cp {} {}".format(shlex.quote(str(source)), target))
+        steps.append("${CROSS_ROOT}/bin/${CROSS_COMPILE}strip " + target)
+    run_container(runtime, platform, ["sh", "-c", " && ".join(steps)])
+    return out
+
+
+def build_platforms(platforms, runtime, kind, requested_version):
+    version = app_version(requested_version)
+    ensure_dependencies()
+    for platform in platforms:
+        print("== Building {} ({}, {}) ==".format(platform, kind, version), flush=True)
+        if platform == HOST:
+            build_host(kind, version)
+        else:
+            build_device(platform, runtime, kind, version)
+    return version
+
+
+def command_build(args):
+    platforms = resolve_platforms(args.targets, default=(HOST,))
+    build_platforms(platforms, container_runtime(args), args.kind, args.version)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
+def command_test(args):
+    kind = "coverage" if args.coverage else "debug"
+    out = output_dir(HOST, kind)
+    if args.coverage and out.exists():
+        # Counters from an earlier run would inflate this one.
+        shutil.rmtree(out)
+    ensure_dependencies()
+    version = app_version("auto")
+
+    suites = ("unit", "e2e") if args.suite == "all" else (args.suite,)
+    sources = []
+    if "unit" in suites:
+        sources.append(TEST_NAME)
+    if "e2e" in suites:
+        sources.extend([APP_NAME, E2E_NAME])
+    build_host(kind, version, sources)
+
+    if "unit" in suites:
+        run_command([out / TEST_NAME])
+    if "e2e" in suites:
+        env = os.environ.copy()
+        env["CHEAT_MANAGER_BIN"] = str(out / APP_NAME)
+        run_command([out / E2E_NAME], env=env)
+
+    if args.coverage:
+        report_coverage(out / "nimcache")
+    return 0
+
+
+def report_coverage(nimcache):
+    if not shutil.which("gcovr"):
+        raise DevError("--coverage needs gcovr on PATH")
+    gcda = nimcache / "@m{}.nim.c.gcda".format(APP_NAME)
+    flags = ["--filter", APP_NAME + ".nim",
+             "--gcov-ignore-errors=no_working_dir_found",
+             "--gcov-ignore-errors=source_not_found",
+             "--object-directory", nimcache]
+    run_command(["gcovr", *flags, gcda, "--print-summary"])
+    COVERAGE_DIR.mkdir(exist_ok=True)
+    run_command(["gcovr", *flags, gcda, "--html", "--html-details",
+                 "-o", COVERAGE_DIR / "index.html"])
+    print("Created " + str((COVERAGE_DIR / "index.html").relative_to(ROOT)))
+
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+
+def stage_pak(platform, kind, destination):
+    """Lay out the pak of `platform` in `destination`."""
+    if destination.exists():
+        shutil.rmtree(destination)
+    bin_dir = destination / "bin" / "arm"
+    bin_dir.mkdir(parents=True)
+    for name in PAK_FILES:
+        shutil.copy2(ROOT / name, destination / name)
+    for name in (APP_NAME, *HELPER_DEPENDENCIES):
+        binary = output_dir(platform, kind) / name
+        if not binary.is_file():
+            raise DevError("{} is not built".format(binary.relative_to(ROOT)))
+        shutil.copy2(binary, bin_dir / name)
+    for path in [destination / "launch.sh", *bin_dir.iterdir()]:
+        path.chmod(0o755)
+    return destination
+
+
+def create_zip(source_dir, archive_path):
+    """Pack `source_dir` into `archive_path`, with paths relative to `source_dir`."""
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.unlink(missing_ok=True)
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(source_dir.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(source_dir))
+    return archive_path
+
+
+def command_dist(args):
+    """Build one .pakz per platform and one .pakz for every platform, each the
+    tree that the package puts at the root of the SD card."""
+    platforms = resolve_platforms(args.targets, default=("all",), allow_host=False)
+    if args.strict and set(platforms) != set(DEVICE_PLATFORMS):
+        raise DevError("--strict requires every platform: " + ", ".join(DEVICE_PLATFORMS))
+    build_platforms(platforms, container_runtime(args), args.kind, args.version)
+
+    if DIST_DIR.exists():
+        shutil.rmtree(DIST_DIR)
+    staging = DIST_DIR / "staging"
+    for platform in platforms:
+        tree = staging / platform
+        stage_pak(platform, args.kind, tree / "Tools" / platform / PAK_NAME)
+        archive = create_zip(tree, DIST_DIR / "{}-{}.pakz".format(PAKZ_BASE, platform))
+        print("Created " + str(archive.relative_to(ROOT)))
+        stage_pak(platform, args.kind, staging / "all" / "Tools" / platform / PAK_NAME)
+    archive = create_zip(staging / "all", DIST_DIR / "{}.pakz".format(PAKZ_BASE))
+    print("Created " + str(archive.relative_to(ROOT)))
+    shutil.rmtree(staging)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Device commands
+# ---------------------------------------------------------------------------
+
+def command_devices(_args):
+    devices = list_devices()
+    if not devices:
+        print("No ADB devices")
+    for device in devices:
+        print("{:24} {:12} {:8} {}".format(
+            device.serial, device.state, device.platform, device.hardware))
+    return 0
+
+
+def command_install(args, run=None):
+    run = args.run if run is None else run
+    devices = resolve_devices(args.targets)
+    platforms = unique(device.platform for device in devices)
+    build_platforms(platforms, container_runtime(args), args.kind, args.version)
+
+    failures = []
+    for device in devices:
+        try:
+            with tempfile.TemporaryDirectory(prefix="pak-", dir=BUILD_DIR) as temp_dir:
+                pak = stage_pak(device.platform, args.kind, Path(temp_dir) / PAK_NAME)
+                stop_app(device)
+                if args.delete:
+                    adb_shell(device, "rm", "-rf", remote_pak_path(device.platform))
+                parent = "{}/{}".format(REMOTE_ROOT, device.platform)
+                adb_shell(device, "mkdir", "-p", parent)
+                print("Uploading pak to {}:{}/".format(device.serial, parent), flush=True)
+                adb(device, "push", pak, parent + "/")
+            if run:
+                launch_from_nextui(device)
+        except DevError as error:
+            failures.append("{}: {}".format(device.serial, error))
+    if failures:
+        raise DevError("\n".join(failures))
+    return 0
+
+
+def command_run(args):
+    command_install(args, run=True)
+    if args.follow:
+        return command_log(argparse.Namespace(targets=args.targets, follow=True, lines=10))
+    return 0
+
+
+def command_kill(args):
+    for device in resolve_devices(args.targets):
+        state = "Killed" if stop_app(device) else "Not running:"
+        print("{} {} on {}".format(state, APP_NAME, device.serial), flush=True)
+    return 0
+
+
+def command_log(args):
+    devices = resolve_devices(args.targets)
+    if len(devices) != 1:
+        details = ", ".join("{} ({})".format(d.serial, d.platform) for d in devices)
+        raise DevError("log requires exactly one device; resolved: " + details)
+    device = devices[0]
+    # launch.sh writes $LOGS_PATH/<pak name>.txt.
+    log_path = "/mnt/SDCARD/.userdata/{}/logs/{}.txt".format(
+        device.platform, PAK_NAME.rsplit(".", 1)[0])
+    command = ["tail", "-n", str(args.lines)]
+    if args.follow:
+        command.append("-f")
+    command.append(log_path)
+    print("{} {}:{}".format("Following" if args.follow else "Reading",
+                            device.serial, log_path), flush=True)
+    return run_command(["adb", "-s", device.serial, "shell", shlex.join(command)],
+                       check=False).returncode
+
+
+def command_clean(args):
+    for path in (BUILD_DIR, DIST_DIR, COVERAGE_DIR):
+        if path.exists():
+            shutil.rmtree(path)
+            print("Removed " + str(path.relative_to(ROOT)))
+    if args.deps:
+        for entry in load_dependencies():
+            for path in DEPS_DIR.glob(entry.name + "-*"):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                print("Removed " + str(path.relative_to(ROOT)))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+def add_version_option(parser):
+    parser.add_argument("--version", default="auto",
+                        help="version in the binary (default: auto, with +local)")
+
+
+def add_build_kind_option(parser, default):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--debug", dest="kind", action="store_const", const="debug",
+                       help="unoptimized, with debug info"
+                       + (" (default)" if default == "debug" else ""))
+    group.add_argument("--release", dest="kind", action="store_const", const="release",
+                       help="optimized for size, stripped"
+                       + (" (default)" if default == "release" else ""))
+    parser.set_defaults(kind=default)
+
+
+def add_container_runtime_options(parser):
+    runtime = parser.add_mutually_exclusive_group()
+    runtime.add_argument("--docker", dest="container_runtime", action="store_const",
+                         const="docker", help="use Docker for device builds")
+    runtime.add_argument("--podman", dest="container_runtime", action="store_const",
+                         const="podman", help="use Podman for device builds")
+
+
+def add_build_options(parser, kind):
+    add_container_runtime_options(parser)
+    add_build_kind_option(parser, kind)
+    add_version_option(parser)
+
+
+PLATFORM_HELP = "platform or alias: {}, host, or all".format(", ".join(DEVICE_PLATFORMS))
+DEVICE_HELP = "platform, alias, ADB serial, or device (default: every connected device)"
+
+
+def add_command(subparsers, name, handler, help_text, **kwargs):
+    parser = subparsers.add_parser(name, help=help_text, description=help_text,
+                                   formatter_class=CommandHelpFormatter, **kwargs)
+    parser.set_defaults(handler=handler, command_parser=parser)
+    return parser
+
+
+def create_parser():
+    parser = argparse.ArgumentParser(
+        prog="./dev", description="Cheat Downloader Offline developer tool.",
+        formatter_class=CommandHelpFormatter)
+    subparsers = parser.add_subparsers(dest="command", metavar="command")
+
+    deps = add_command(subparsers, "deps", command_deps, "manage pinned dependencies")
+    deps_commands = deps.add_subparsers(dest="deps_command", metavar="command")
+    add_command(deps_commands, "list", command_deps_list, "show pinned dependencies")
+    fetch = add_command(deps_commands, "fetch", command_deps_fetch,
+                        "download and check pinned dependencies")
+    fetch.add_argument("name", nargs="?", help="one dependency (default: all)")
+    add_command(deps_commands, "outdated", command_deps_outdated,
+                "compare pins with the latest upstream versions")
+    update = add_command(deps_commands, "update", command_deps_update,
+                         "pin the latest upstream version and record its hashes")
+    update.add_argument("name", nargs="?", help="one dependency (default: all)")
+    update.add_argument("--version", help="pin this version instead of the latest")
+
+    build = add_command(subparsers, "build", command_build, "compile the app")
+    build.add_argument("targets", nargs="*", metavar="target",
+                       help=PLATFORM_HELP + " (default: host)")
+    add_build_options(build, "debug")
+
+    test = add_command(subparsers, "test", command_test, "build and run the host tests")
+    test.add_argument("suite", nargs="?", choices=("all", "unit", "e2e"), default="all",
+                      help="which tests to run (default: all)")
+    test.add_argument("--coverage", action="store_true",
+                      help="instrument the build and write coverage/index.html")
+
+    dist = add_command(subparsers, "dist", command_dist, "build the .pakz packages")
+    dist.add_argument("targets", nargs="*", metavar="target",
+                      help="device platform or alias (default: all)")
+    dist.add_argument("--strict", action="store_true",
+                      help="require every platform, as a release does")
+    add_build_options(dist, "release")
+
+    install = add_command(subparsers, "install", command_install,
+                          "build and upload the pak to connected devices")
+    install.add_argument("targets", nargs="*", metavar="target", help=DEVICE_HELP)
+    install.add_argument("--run", action="store_true", help="launch the pak after the upload")
+    install.add_argument("--delete", action="store_true",
+                         help="remove the installed pak before the upload")
+    add_build_options(install, "debug")
+
+    run = add_command(subparsers, "run", command_run, "install and launch the pak")
+    run.add_argument("targets", nargs="*", metavar="target", help=DEVICE_HELP)
+    run.add_argument("--delete", action="store_true",
+                     help="remove the installed pak before the upload")
+    run.add_argument("-f", "--follow", action="store_true", help="follow the log after launch")
+    add_build_options(run, "debug")
+
+    kill = add_command(subparsers, "kill", command_kill, "stop the app on devices")
+    kill.add_argument("targets", nargs="*", metavar="target", help=DEVICE_HELP)
+
+    log = add_command(subparsers, "log", command_log, "show the log of the pak on a device")
+    log.add_argument("targets", nargs="*", metavar="target", help=DEVICE_HELP)
+    log.add_argument("-f", "--follow", action="store_true", help="follow the log")
+    log.add_argument("-n", "--lines", type=int, default=50, help="lines to show (default: 50)")
+
+    add_command(subparsers, "devices", command_devices, "list ADB devices and their platforms")
+
+    clean = add_command(subparsers, "clean", command_clean,
+                        "remove build/, dist/, and coverage/")
+    clean.add_argument("--deps", action="store_true", help="remove fetched dependencies too")
+
+    version = add_command(subparsers, "version", command_version, "manage pak.json versions")
+    version_commands = version.add_subparsers(dest="version_command", metavar="command")
+    get = add_command(version_commands, "get", command_version,
+                      "print the version that a build bakes in")
+    get.add_argument("--identifier", default="local",
+                     help="build identifier after '+' (default: local)")
+    get.set_defaults(version_handler=version_get)
+    validate = add_command(version_commands, "validate-release", command_version,
+                           "check a release tag against pak.json")
+    validate.add_argument("tag")
+    validate.set_defaults(version_handler=version_validate_release)
+    note = add_command(version_commands, "note", command_version,
+                       "print the changelog note of a version")
+    note.add_argument("version")
+    note.set_defaults(version_handler=version_note)
+    latest = add_command(version_commands, "latest", command_version,
+                         "print the newest changelog entry")
+    latest.set_defaults(version_handler=version_latest)
+    listing = add_command(version_commands, "list", command_version, "print the changelog")
+    listing.set_defaults(version_handler=version_list)
+    create = add_command(version_commands, "create", command_version,
+                         "start a release: set the version and add its note")
+    create.add_argument("version")
+    create.add_argument("text", nargs="+")
+    create.set_defaults(version_handler=version_create)
+    change = add_command(version_commands, "update", command_version,
+                         "replace the note of a version")
+    change.add_argument("version")
+    change.add_argument("text", nargs="+")
+    change.set_defaults(version_handler=version_update)
+    remove = add_command(version_commands, "remove", command_version,
+                         "remove a version from the changelog")
+    remove.add_argument("version")
+    remove.set_defaults(version_handler=version_remove)
+    return parser
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        return 0
+    try:
+        BUILD_DIR.mkdir(exist_ok=True)
+        return args.handler(args)
+    except DevError as error:
+        print("error: " + str(error), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
