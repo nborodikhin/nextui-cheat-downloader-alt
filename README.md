@@ -11,8 +11,8 @@ A MinUI pak for browsing, finding, and installing game cheat files from the Libr
 
 This pak runs on these NextUI devices:
 
-- `tg5040`: TrimUI Brick
-- `tg5050`: TrimUI Smart Pro
+- `tg5040`: TrimUI Smart Pro, TrimUI Brick, TrimUI Brick Pro
+- `tg5050`: TrimUI Smart Pro S
 - `my355`: Miyoo Flip
 - `h700`: Anbernic RG devices with the H700 chip
 

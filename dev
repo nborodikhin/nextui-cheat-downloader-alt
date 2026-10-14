@@ -966,8 +966,11 @@ def build_device(platform, runtime, kind, version):
         target = shlex.quote("{}/{}".format(container_out, name))
         steps.append("cp {} {}".format(shlex.quote(str(source)), target))
         steps.append("${CROSS_ROOT}/bin/${CROSS_COMPILE}strip " + target)
-    run_container(runtime, platform, ["sh", "-c", " && ".join(steps)])
-    restore_ownership(runtime, platform, out, container_out)
+    try:
+        run_container(runtime, platform, ["sh", "-c", " && ".join(steps)])
+    finally:
+        # A failed build leaves outputs too.
+        restore_ownership(runtime, platform, out, container_out)
     return out
 
 
