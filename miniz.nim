@@ -4,7 +4,7 @@
 ## Override the miniz source path at compile time with:
 ##   nim c -d:minizDir=/path/to/miniz ...
 
-const minizDir {.strdefine.} = "workspace/miniz-3.1.1"
+const minizDir {.strdefine.} = "deps/miniz-3.1.1"
 const minizC = minizDir & "/miniz.c"
 
 {.compile(minizC, "-DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_WRITING_APIS -DMINIZ_NO_ZLIB_APIS -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES -DMINIZ_NO_TIME").}

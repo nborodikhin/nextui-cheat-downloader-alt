@@ -1,82 +1,90 @@
-# Manual runs (workflow_dispatch) build and upload artifacts — no GitHub Release.
-# Pushing a tag matching v* runs the same pipeline, validates pak.json, then publishes a Release.
-# Coverage report is published to GitHub Pages after every successful run.
+# A pushed v* tag publishes a GitHub Release. vX.Y.Z must match pak.json and
+# have a changelog note; vX.Y.Z-<label>.N is a pre-release.
 name: Release
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
     tags:
-      - "v*"
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
 jobs:
-  build:
+  version:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Validate pak.json matches tag
-        if: github.ref_type == 'tag'
+      - name: Require a tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
         run: |
-          set -eux
-          TAG="${GITHUB_REF#refs/tags/}"
-          V="$(jq -r '.version' pak.json)"
-          test "$V" = "$TAG"
-          jq -e --arg t "$TAG" '.changelog[$t] != null and ((.changelog[$t] | type) == "string") and ((.changelog[$t] | length) > 0)' pak.json
+          if [ "$REF_TYPE" != tag ]; then
+            echo 'A release requires a tag.' >&2
+            exit 1
+          fi
 
-      - name: Install host packages
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check release version
+        id: version
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q jq zip wget unzip xz-utils gcovr
+          VERSION="$GITHUB_REF_NAME"
+          ./dev version validate-release "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo 'prerelease=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'prerelease=false' >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Fetch dependencies and cross-toolchain binaries
-        run: sh build-deps.sh
+  test:
+    needs: version
+    uses: ./.github/workflows/test.yml
+    # The Pages job of test.yml asks for these; it does not run for a tag.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
 
-      - name: Add Nim to PATH
-        run: echo "PATH=${{ github.workspace }}/workspace/nim-2.2.8/bin:$PATH" >> "$GITHUB_ENV"
+  release:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
 
-      - name: Run tests with coverage
-        run: make coverage
-
-      - name: Upload coverage report to Pages
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: coverage/
-
-      - name: Build release artifacts
-        run: sh build-release.sh
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-dist
-          path: |
-            release/CheatDownloaderOffline-*.pak.zip
-            release/CheatDownloaderOffline.pakz
+      - name: Build and package release
+        run: ./dev dist all --strict --version "$VERSION"
 
       - name: Create GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/CheatDownloaderOffline-*.pak.zip
-            release/CheatDownloaderOffline.pakz
-
-  deploy-pages:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy coverage to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          FLAGS=(--latest)
+          if [ "$PRERELEASE" = true ]; then
+            FLAGS=(--prerelease --latest=false)
+          fi
+          NOTE=$(./dev version note "$VERSION")
+          if [ -n "$NOTE" ]; then
+            FLAGS+=(--notes "$NOTE")
+          else
+            FLAGS+=(--generate-notes)
+          fi
+          gh release create "$VERSION" \
+            --verify-tag \
+            --title "$VERSION" \
+            "${FLAGS[@]}" \
+            dist/*.pakz

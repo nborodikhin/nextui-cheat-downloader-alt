@@ -25,4 +25,4 @@ touch \
   "$ROM_DIR/Sony PlayStation (PS)/Metal Gear Solid/Metal Gear Solid [Disc2of2] [U] [SLUS-00776].chd" \
   "$ROM_DIR/Sony PlayStation (PS)/Metal Gear Solid/Metal Gear Solid.m3u"
 
-./cheat_manager textui debug
+"$(dirname "$0")/build/debug/host/cheat_manager" textui debug

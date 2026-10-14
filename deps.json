@@ -1,0 +1,57 @@
+{
+  "dependencies": [
+    {
+      "name": "nim",
+      "version": "2.2.8",
+      "github": "nim-lang/Nim",
+      "latest": "tags",
+      "tag_prefix": "v",
+      "url": "https://nim-lang.org/download/nim-{version}-{host}",
+      "hosts": {
+        "linux_x64": "linux_x64.tar.xz",
+        "linux_arm64": "linux_arm64.tar.xz",
+        "macosx_arm64": "macosx_arm64.tar.xz",
+        "macosx_x64": "macosx_x64.tar.xz"
+      },
+      "unpack": "tar",
+      "sha256": {
+        "linux_x64": "eed763d0f8ed849781198fe18730638eb520e5ada81d8bc916f8d3c1b256dd6e",
+        "linux_arm64": "19d8f79b054d40f41bb125ee5dd7867b446e7ea386d96a703d835159e3237301",
+        "macosx_arm64": "b4b804ec4dc4eb8e89fe12751481a7fb11a8e4b8918f110068be6cceafe52a8e",
+        "macosx_x64": "c77c945cd3e465bdba76ddd6393fe5babf0a724f162c9ecb4bffec19b83e88ba"
+      }
+    },
+    {
+      "name": "miniz",
+      "version": "3.1.1",
+      "github": "richgel999/miniz",
+      "url": "https://github.com/richgel999/miniz/releases/download/{version}/miniz-{version}.zip",
+      "unpack": "zip",
+      "sha256": "cb28402bb2af93bdc331b60d16807e89727d1712a2d0a7ba0cac79a3e406fe40"
+    },
+    {
+      "name": "minui-list",
+      "version": "0.15.4",
+      "github": "josegonzalez/minui-list",
+      "url": "https://github.com/josegonzalez/minui-list/releases/download/{version}/minui-list-{platform}-nextui",
+      "sha256": {
+        "tg5040": "c7cc8049096b9091de9517ff9ce886d2c42a45d43a6fa51fc9c4877eeb68cc20",
+        "tg5050": "4dd6f5de33e0c1d842d41debf808e08befdc404265bf32c90522d8de564e4112",
+        "my355": "06e76bb963d13f32bde96018d5adc0a82e008118e6d2b9b5631581cdde2b5390",
+        "h700": "f85b0df834ac4a6be03d6525364b41578f669993cce64ae706d91a70d98eb622"
+      }
+    },
+    {
+      "name": "minui-presenter",
+      "version": "0.13.4",
+      "github": "josegonzalez/minui-presenter",
+      "url": "https://github.com/josegonzalez/minui-presenter/releases/download/{version}/minui-presenter-{platform}-nextui",
+      "sha256": {
+        "tg5040": "717a03026270f50986ad4d2886acc4b28e1a2119881f96a1ae768ced3e7c118c",
+        "tg5050": "3c556b7a57371d4eb704fe6f83de7f58f0d8b4e9ab22c81999715a517836434d",
+        "my355": "110a3d53d498a19ce8c97ac08fd8a308833adae99425582ffdd6167d7d14d189",
+        "h700": "519d5e900675b1893aa32f5f82515884f0027af88070e66c5e0cb72a394e2f20"
+      }
+    }
+  ]
+}

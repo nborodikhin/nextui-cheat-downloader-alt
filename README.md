@@ -9,29 +9,22 @@ A MinUI pak for browsing, finding, and installing game cheat files from the Libr
 
 ## Requirements
 
-This pak is tested on the following NextUI devices:
+This pak runs on these NextUI devices:
 
-- `tg5040`: TrimUI Brick
+- `tg5040`: TrimUI Smart Pro, TrimUI Brick, TrimUI Brick Pro
+- `tg5050`: TrimUI Smart Pro S
+- `my355`: Miyoo Flip
+- `h700`: Anbernic RG devices with the H700 chip
 
 ## Installation
 
-1. Simple
-
-    - Mount your NextUI SD card.
-    - Download .pakz from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader-alt/releases).
-    - Put it into the root of the SD card
-    - Unmount SD card
-    - Pak will be installed on the next NextUI boot
-
-2. Manual (here for tg5040, replace with your device identifier is needed)
-
-    - Mount your NextUI SD card.
-    - Download CheatDownloader.pak.tg5040.zip from the latest release version from [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader-alt/releases).
-    - Unpack it into `/Tools/tg5040/`
-    - You should have files in the subfolder, e.g. `/Tools/tg5040/Cheat Downloader Offline/launch.sh`
-    - Unmount SD card
-    - Pak will be available on the next NextUI boot
-
+- Mount your NextUI SD card.
+- Download a `.pakz` file from the latest release on [GitHub releases](https://github.com/nborodikhin/nextui-cheat-downloader-alt/releases):
+  - `CheatDownloaderOffline-<platform>.pakz` holds the pak for one platform, for example `CheatDownloaderOffline-tg5040.pakz`.
+  - `CheatDownloaderOffline.pakz` holds the pak for all platforms.
+- Put it into the root of the SD card.
+- Unmount the SD card.
+- NextUI installs the pak on the next boot.
 
 ## Usage
 
@@ -60,6 +53,19 @@ This pak is tested on the following NextUI devices:
 - Cheats are installed to your NextUI Cheats folder, organized in subfolders by system tag (e.g. `GBA/`, `PS/`).
 - The cheat database is cached at `/mnt/SDCARD/.userdata/Cheat Downloader Offline/` as a local SQLite index, so searching is fast and works entirely offline after the initial download.
 - Folder-to-system mappings and your last-used game per system are remembered across sessions.
+
+## Development
+
+`./dev` is the entry point for development. It runs on Linux (x64, arm64) and macOS (Apple Silicon, Intel). It needs Python 3, and Docker or Podman for device builds.
+
+```sh
+./dev deps fetch        # download the pinned dependencies from deps.json
+./dev test              # build and run the unit and end-to-end tests on the host
+./dev build all         # cross-compile for every device platform
+./dev dist              # build the .pakz packages into dist/
+./dev run brick         # install the pak on a connected device over ADB and launch it
+./dev --help            # every command
+```
 
 ## Acknowledgements
 

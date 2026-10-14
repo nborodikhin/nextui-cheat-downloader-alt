@@ -9,7 +9,8 @@
   "platforms": [
     "tg5040",
     "tg5050",
-    "my355"
+    "my355",
+    "h700"
   ],
   "changelog": {
     "v1.6.0": "Add pre-downloaded file processing (zip file at the root of the SD card).",

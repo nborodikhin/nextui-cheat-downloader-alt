@@ -81,6 +81,9 @@ var
   offlineMode: bool = false
 
 const
+  ## Set by the build: ./dev passes -d:appVersion=<version>.
+  appVersion* {.strdefine.} = "dev"
+
   CMD_CURL = "curl"
   CMD_MINUI_PRESENTER = "minui-presenter"
   CMD_MINUI_LIST = "minui-list"
@@ -1302,7 +1305,10 @@ when isMainModule:
   var textui = false
   var jsonuiMode = false
   for arg in commandLineParams():
-    if arg == "textui":
+    if arg in ["version", "--version"]:
+      echo appVersion
+      quit(0)
+    elif arg == "textui":
       textui = true
     elif arg == "jsonui":
       jsonuiMode = true
@@ -1310,6 +1316,8 @@ when isMainModule:
       debugMode = true
     elif arg == "offline":
       offlineMode = true
+
+  echo "Cheat Downloader Offline ", appVersion
 
   # Check for required environment variables
   env.romDir = getEnv("ROM_DIR")
