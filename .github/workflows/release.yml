@@ -14,6 +14,7 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -54,6 +55,7 @@ jobs:
   release:
     needs: [version, test]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     env:

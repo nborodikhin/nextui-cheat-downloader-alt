@@ -381,12 +381,37 @@ def latest_version(entry):
     return tag
 
 
+def checked_members(bundle, staging):
+    """The members of `bundle`, for Python without tar extraction filters
+    (before 3.11.4 and 3.12). Refuses a member or link target outside
+    `staging` and every special file, as the "data" filter does."""
+    root = staging.resolve()
+    for member in bundle.getmembers():
+        target = (root / member.name).resolve()
+        if member.issym():
+            link = (target.parent / member.linkname).resolve()
+        elif member.islnk():
+            link = (root / member.linkname).resolve()
+        else:
+            link = target
+        if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+            raise DevError("{}: refusing special file {}".format(bundle.name, member.name))
+        for path in (target, link):
+            if path != root and root not in path.parents:
+                raise DevError("{}: refusing {} outside the archive".format(
+                    bundle.name, member.name))
+        yield member
+
+
 def unpack_archive(entry, archive, destination):
     staging = Path(tempfile.mkdtemp(prefix="unpack-", dir=DEPS_DIR))
     try:
         if entry.unpack == "tar":
             with tarfile.open(archive) as bundle:
-                bundle.extractall(staging, filter="data")
+                if hasattr(tarfile, "data_filter"):
+                    bundle.extractall(staging, filter="data")
+                else:
+                    bundle.extractall(staging, members=checked_members(bundle, staging))
         elif entry.unpack == "zip":
             with zipfile.ZipFile(archive) as bundle:
                 bundle.extractall(staging)
@@ -942,7 +967,20 @@ def build_device(platform, runtime, kind, version):
         steps.append("cp {} {}".format(shlex.quote(str(source)), target))
         steps.append("${CROSS_ROOT}/bin/${CROSS_COMPILE}strip " + target)
     run_container(runtime, platform, ["sh", "-c", " && ".join(steps)])
+    restore_ownership(runtime, platform, out, container_out)
     return out
+
+
+def restore_ownership(runtime, platform, out, container_out):
+    """Give the build outputs back to the user. A rootful Docker writes them
+    as root, thus ./dev clean could not remove them. Rootless Docker and Podman
+    write them as the user already; a chown there would map to a subordinate
+    ID, thus it runs only when an output has another owner."""
+    uid, gid = os.getuid(), os.getgid()
+    if all(path.lstat().st_uid == uid for path in out.rglob("*")):
+        return
+    run_container(runtime, platform,
+                  ["chown", "-R", "{}:{}".format(uid, gid), container_out])
 
 
 def build_platforms(platforms, runtime, kind, requested_version):
