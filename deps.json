@@ -6,9 +6,20 @@
       "github": "nim-lang/Nim",
       "latest": "tags",
       "tag_prefix": "v",
-      "url": "https://nim-lang.org/download/nim-{version}-linux_x64.tar.xz",
+      "url": "https://nim-lang.org/download/nim-{version}-{host}",
+      "hosts": {
+        "linux_x64": "linux_x64.tar.xz",
+        "linux_arm64": "linux_arm64.tar.xz",
+        "macosx_arm64": "macosx_arm64.tar.xz",
+        "macosx_x64": "macosx_x64.tar.xz"
+      },
       "unpack": "tar",
-      "sha256": "eed763d0f8ed849781198fe18730638eb520e5ada81d8bc916f8d3c1b256dd6e"
+      "sha256": {
+        "linux_x64": "eed763d0f8ed849781198fe18730638eb520e5ada81d8bc916f8d3c1b256dd6e",
+        "linux_arm64": "19d8f79b054d40f41bb125ee5dd7867b446e7ea386d96a703d835159e3237301",
+        "macosx_arm64": "b4b804ec4dc4eb8e89fe12751481a7fb11a8e4b8918f110068be6cceafe52a8e",
+        "macosx_x64": "c77c945cd3e465bdba76ddd6393fe5babf0a724f162c9ecb4bffec19b83e88ba"
+      }
     },
     {
       "name": "miniz",

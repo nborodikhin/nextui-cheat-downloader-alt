@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform as platform_module
 import re
 import shlex
 import shutil
@@ -33,6 +34,8 @@ ROOT = Path(__file__).resolve().parent
 # `./dev deps update` to record the hashes of its MinUI helpers.
 DEVICE_PLATFORMS = ("tg5040", "tg5050", "my355", "h700")
 HOST = "host"
+# The toolchain images are Linux x64, thus they run the Linux x64 Nim.
+CONTAINER_HOST = "linux_x64"
 BUILD_KINDS = ("debug", "release")
 APP_NAME = "cheat_manager"
 TEST_NAME = "cheat_manager_test"
@@ -162,14 +165,29 @@ def unique(values):
 # Dependencies
 # ---------------------------------------------------------------------------
 
+def current_host():
+    """The key of the build machine in the `hosts` of a dependency."""
+    system, machine = platform_module.system(), platform_module.machine()
+    if system == "Darwin":
+        return "macosx_arm64" if machine == "arm64" else "macosx_x64"
+    if system == "Linux" and machine in ("x86_64", "AMD64"):
+        return CONTAINER_HOST
+    if system == "Linux" and machine in ("aarch64", "arm64"):
+        return "linux_arm64"
+    raise DevError("No host build for {} {}".format(system, machine))
+
+
 @dataclass
 class Dependency:
     """One pinned download from deps.json.
 
-    `url` may name {version} and {platform}. With {platform}, the dependency is
-    one file per device platform and `sha256` maps each platform to its hash;
-    otherwise `sha256` is the hash of the one file. `unpack` is "tar", "zip",
-    or empty for a single executable file.
+    A dependency is one file, or one file per variant:
+    - `url` with {platform}: one file per device platform.
+    - `url` with {host}: one file per build machine; `hosts` maps each host
+      key to the text that replaces {host}. Fetch takes the container host
+      and the current host.
+    `sha256` is the hash of the one file, or maps each variant to its hash.
+    `unpack` is "tar", "zip", or empty for a single executable file.
     """
 
     name: str
@@ -180,6 +198,7 @@ class Dependency:
     unpack: str = ""
     latest: str = "release"
     tag_prefix: str = ""
+    hosts: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
 
     @property
@@ -187,23 +206,44 @@ class Dependency:
         return "{platform}" in self.url
 
     @property
+    def per_host(self):
+        return "{host}" in self.url
+
+    @property
     def root(self):
         return DEPS_DIR / "{}-{}".format(self.name, self.version)
 
-    def file_url(self, platform=None):
-        return self.url.format(version=self.version, platform=platform)
+    def variants(self):
+        """Every variant that deps.json records a hash for."""
+        if self.per_platform:
+            return list(DEVICE_PLATFORMS)
+        if self.per_host:
+            return list(self.hosts)
+        return [None]
 
-    def expected_hashes(self):
-        """Gives {platform or None: sha256} for every file of the dependency."""
-        if not self.per_platform:
+    def needed_variants(self):
+        """The variants that this machine fetches."""
+        if self.per_host:
+            return unique([CONTAINER_HOST, current_host()])
+        return self.variants()
+
+    def file_url(self, variant=None):
+        return self.url.format(version=self.version, platform=variant,
+                               host=self.hosts.get(variant))
+
+    def expected_hashes(self, variants=None):
+        """Gives {variant: sha256} for `variants` (default: every variant)."""
+        if not (self.per_platform or self.per_host):
             return {None: self.sha256 or ""}
         hashes = self.sha256 if isinstance(self.sha256, dict) else {}
-        return {platform: hashes.get(platform, "") for platform in DEVICE_PLATFORMS}
+        return {variant: hashes.get(variant, "") for variant in variants or self.variants()}
 
-    def path(self, platform=None):
-        """The fetched file of `platform`, or the unpacked tree."""
+    def path(self, variant=None):
+        """The fetched file of a platform, or the unpacked tree of a host."""
         if self.per_platform:
-            return self.root / platform / self.name
+            return self.root / variant / self.name
+        if self.per_host:
+            return self.root / variant
         return self.root
 
     def to_json(self):
@@ -214,6 +254,8 @@ class Dependency:
         if self.tag_prefix:
             entry["tag_prefix"] = self.tag_prefix
         entry["url"] = self.url
+        if self.hosts:
+            entry["hosts"] = self.hosts
         if self.unpack:
             entry["unpack"] = self.unpack
         entry["sha256"] = self.sha256
@@ -229,7 +271,8 @@ def load_dependencies():
         raise DevError("{}: {}".format(DEPS_MANIFEST.name, error))
 
     dependencies = []
-    known = {"name", "version", "url", "github", "sha256", "unpack", "latest", "tag_prefix"}
+    known = {"name", "version", "url", "github", "sha256", "unpack", "latest", "tag_prefix",
+             "hosts"}
     for index, entry in enumerate(manifest.get("dependencies", [])):
         missing = [key for key in ("name", "version", "url", "github") if key not in entry]
         if missing:
@@ -244,6 +287,7 @@ def load_dependencies():
             unpack=entry.get("unpack", ""),
             latest=entry.get("latest", "release"),
             tag_prefix=entry.get("tag_prefix", ""),
+            hosts=entry.get("hosts", {}),
             extra={key: value for key, value in entry.items() if key not in known},
         ))
     return dependencies
@@ -291,12 +335,12 @@ def github_request(path):
         raise DevError("GitHub API {}: {}".format(path, error))
 
 
-def cached_download(entry, platform=None):
+def cached_download(entry, variant=None):
     """Download one file of `entry` into deps/.downloads, unless it is there.
     `deps update` hashes the file and `deps fetch` then uses it, thus each file
     is downloaded once."""
-    url = entry.file_url(platform)
-    name = "{}-{}-{}".format(entry.name, entry.version, platform or url.rsplit("/", 1)[-1])
+    url = entry.file_url(variant)
+    name = "{}-{}-{}".format(entry.name, entry.version, variant or url.rsplit("/", 1)[-1])
     destination = DOWNLOADS_DIR / name
     if destination.exists():
         return destination
@@ -359,8 +403,8 @@ def unpack_archive(entry, archive, destination):
 def fetch_dependency(entry):
     """Download, check, and unpack one dependency. Does nothing when the tree
     on disk came from the same hashes."""
-    hashes = entry.expected_hashes()
-    unhashed = [platform or entry.name for platform, value in hashes.items() if not value]
+    hashes = entry.expected_hashes(entry.needed_variants())
+    unhashed = [variant or entry.name for variant, value in hashes.items() if not value]
     if unhashed:
         raise DevError("{} {} has no sha256 for {}. Run ./dev deps update {}.".format(
             entry.name, entry.version, ", ".join(unhashed), entry.name))
@@ -373,15 +417,20 @@ def fetch_dependency(entry):
     DEPS_DIR.mkdir(parents=True, exist_ok=True)
     if entry.root.exists():
         shutil.rmtree(entry.root)
-    downloads = {platform: cached_download(entry, platform) for platform in hashes}
-    for platform, downloaded in downloads.items():
-        check_hash(entry, downloaded, hashes[platform], entry.file_url(platform))
+    downloads = {variant: cached_download(entry, variant) for variant in hashes}
+    for variant, downloaded in downloads.items():
+        check_hash(entry, downloaded, hashes[variant], entry.file_url(variant))
     if entry.per_platform:
         for platform, downloaded in downloads.items():
             target = entry.path(platform)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(downloaded), target)
             target.chmod(0o755)
+    elif entry.per_host:
+        entry.root.mkdir(parents=True)
+        for host, downloaded in downloads.items():
+            unpack_archive(entry, downloaded, entry.path(host))
+            downloaded.unlink()
     elif entry.unpack:
         unpack_archive(entry, downloads[None], entry.root)
         downloads[None].unlink()
@@ -417,9 +466,9 @@ def update_dependency(entry, version):
 
     previous = entry.version
     entry.version = target
-    if entry.per_platform:
-        entry.sha256 = {platform: sha256_of(cached_download(entry, platform))
-                        for platform in DEVICE_PLATFORMS}
+    if entry.per_platform or entry.per_host:
+        entry.sha256 = {variant: sha256_of(cached_download(entry, variant))
+                        for variant in entry.variants()}
     else:
         entry.sha256 = sha256_of(cached_download(entry))
     if previous == target:
@@ -466,6 +515,9 @@ def command_deps_update(args):
         save_dependencies(dependencies)
         for entry in changed:
             fetch_dependency(entry)
+            # Files of other hosts were downloaded only to hash them.
+            for leftover in DOWNLOADS_DIR.glob("{}-{}-*".format(entry.name, entry.version)):
+                leftover.unlink()
     return 0
 
 
@@ -815,15 +867,22 @@ def output_dir(platform, kind):
     return BUILD_DIR / kind / platform
 
 
+def nim_tree(root):
+    """The Nim tree for a build in `root`: the container one under
+    CONTAINER_PROJECT, else the one of this machine."""
+    host = CONTAINER_HOST if root == CONTAINER_PROJECT else current_host()
+    return "{}/{}".format(root, dependency("nim").path(host).relative_to(ROOT))
+
+
 def nim_flags(kind, version, root):
     """Compiler flags with the dependency paths under `root` (the repository on
     the host, or its mount point in a container)."""
-    nim = dependency("nim")
+    nim = nim_tree(root)
     miniz = "{}/deps/miniz-{}".format(root, dependency("miniz").version)
     flags = list(NIM_FLAGS) + [
         "-d:minizDir=" + miniz,
         "--passC:-I" + miniz,
-        "-p:{}/deps/nim-{}/pkgs/db_connector/src".format(root, nim.version),
+        "-p:{}/pkgs/db_connector/src".format(nim),
         "-d:appVersion=" + version,
     ]
     if kind == "release":
@@ -837,7 +896,7 @@ def build_host(kind, version, sources=(APP_NAME,)):
     """Compile `sources` for the host. All of them share one nimcache, thus a
     coverage run merges the counters of every binary."""
     out = output_dir(HOST, kind)
-    nim = dependency("nim").path() / "bin" / "nim"
+    nim = nim_tree(ROOT) + "/bin/nim"
     for source in sources:
         run_command([nim, "c", *nim_flags(kind, version, ROOT),
                      "--nimcache:" + str(out / "nimcache"),
@@ -862,7 +921,7 @@ def build_device(platform, runtime, kind, version):
     out = output_dir(platform, kind)
     out.mkdir(parents=True, exist_ok=True)
     container_out = "{}/build/{}/{}".format(CONTAINER_PROJECT, kind, platform)
-    nim = "{}/deps/nim-{}/bin/nim".format(CONTAINER_PROJECT, dependency("nim").version)
+    nim = nim_tree(CONTAINER_PROJECT) + "/bin/nim"
     gcc = "${CROSS_ROOT}/bin/${CROSS_COMPILE}gcc"
     command = [
         nim, "c", "--cpu:arm64", "--os:linux",

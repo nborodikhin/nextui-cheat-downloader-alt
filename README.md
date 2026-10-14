@@ -56,7 +56,7 @@ This pak runs on these NextUI devices:
 
 ## Development
 
-`./dev` is the entry point for development. It needs Python 3, and Docker or Podman for device builds.
+`./dev` is the entry point for development. It runs on Linux (x64, arm64) and macOS (Apple Silicon, Intel). It needs Python 3, and Docker or Podman for device builds.
 
 ```sh
 ./dev deps fetch        # download the pinned dependencies from deps.json
