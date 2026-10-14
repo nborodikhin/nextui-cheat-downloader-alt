@@ -667,10 +667,34 @@ def get_pids(device, process):
     return [pid for pid in " ".join(lines).split() if pid.isdigit()]
 
 
+def descendants(device, pids):
+    """Every process under `pids` on the device, the deepest first. Reads the
+    parent links from /proc, thus it needs no pgrep."""
+    children = {}
+    # The glob needs the device shell; adb_shell would quote it.
+    for line in adb(device, "shell", "cat /proc/[0-9]*/stat 2>/dev/null", check=False):
+        # pid (comm) state ppid ...; comm may hold spaces, thus split after ")".
+        pid, _, rest = line.partition(" (")
+        fields = rest.rpartition(") ")[2].split()
+        if pid.isdigit() and len(fields) > 1:
+            children.setdefault(fields[1], []).append(pid)
+    order = []
+    def visit(pid):
+        for child in children.get(pid, []):
+            visit(child)
+            order.append(child)
+    for pid in pids:
+        visit(pid)
+    return order
+
+
 def stop_app(device):
+    """Kill the app and the MinUI helpers it started. SIGKILL does not reach
+    the children, thus they go first; a helper left alive would keep the
+    display and the input."""
     pids = get_pids(device, APP_NAME)
     if pids:
-        adb_shell(device, "kill", "-KILL", *pids)
+        adb_shell(device, "kill", "-KILL", *descendants(device, pids), *pids)
     return bool(pids)
 
 
