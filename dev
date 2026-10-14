@@ -930,7 +930,8 @@ def nim_flags(kind, version, root):
     miniz = "{}/deps/miniz-{}".format(root, dependency("miniz").version)
     flags = list(NIM_FLAGS) + [
         "-d:minizDir=" + miniz,
-        "--passC:-I" + miniz,
+        # Nim pastes --passC text into the compiler's shell command unquoted.
+        "--passC:-I" + shlex.quote(miniz),
         "-p:{}/pkgs/db_connector/src".format(nim),
         "-d:appVersion=" + version,
     ]
